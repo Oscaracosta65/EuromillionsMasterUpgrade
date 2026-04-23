@@ -1187,8 +1187,8 @@ $bankrollPlans = [
     ],
 ];
 
-$heroInsight  = 'Latest verified EuroMillions draw with decision-oriented analytics. Review main-number (1\u201350) and Lucky Star (1\u201312) frequency profiles, recency signals, crowd-risk context, and structured planning tools before selecting your next lines.';
-$overviewNote = 'Frequency shows historical occurrence within the selected window. For EuroMillions, main numbers (1\u201350) and Lucky Stars (1\u201312) are tracked in separate pools. Frequency can help identify recent concentration and quiet periods, but should be interpreted as context rather than prediction.';
+$heroInsight  = 'Latest verified EuroMillions draw with decision-oriented analytics. Review main-number (1–50) and Lucky Star (1–12) frequency profiles, recency signals, crowd-risk context, and structured planning tools before selecting your next lines.';
+$overviewNote = 'Frequency shows historical occurrence within the selected window. For EuroMillions, main numbers (1–50) and Lucky Stars (1–12) are tracked in separate pools. Frequency can help identify recent concentration and quiet periods, but should be interpreted as context rather than prediction.';
 
 // Upstream variable fallbacks (these are normally provided by Joomla routing)
 $leStateName  = (string) ($stateName  ?? 'EuroMillions');
