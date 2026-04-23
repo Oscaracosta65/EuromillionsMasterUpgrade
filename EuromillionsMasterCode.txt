@@ -1124,11 +1124,12 @@ $recommendations = [
 ];
 
 $recommendationMap = [];
-foreach ($recommendations as $play) { $recommendationMap[$play['id']] = $play; }
+foreach ($recommendations as $play) { $playId = $play['id']; $recommendationMap[$playId] = $play; }
 
 $crowdScores = [];
 foreach ($recommendations as $play) {
-    $crowdScores[$play['id']] = leCrowdRiskProfile((array) $play['numbers'], $favoriteNumbers);
+    $playId = $play['id'];
+    $crowdScores[$playId] = leCrowdRiskProfile((array) $play['numbers'], $favoriteNumbers);
 }
 
 $combinationProfiles = [
@@ -1624,7 +1625,7 @@ button:disabled{background-color:#a3b3d1;cursor:not-allowed}
           </div>
           <div class="skai-play-meta">
             <strong>Strategy:</strong> <?php echo htmlspecialchars($play['rationale'], ENT_QUOTES, 'UTF-8'); ?><br>
-            <strong>Crowd risk:</strong> <?php echo htmlspecialchars($crowdScores[$play['id']]['label'] ?? '—', ENT_QUOTES, 'UTF-8'); ?><br>
+            <strong>Crowd risk:</strong> <?php $playKey = $play['id']; echo htmlspecialchars($crowdScores[$playKey]['label'] ?? '—', ENT_QUOTES, 'UTF-8'); ?><br>
             <strong>Lines:</strong> <?php echo (int)$play['ticket_count']; ?> &bull;
             <strong>Est. cost:</strong> ~&euro;<?php echo number_format((float)$play['cost'], 2); ?>
           </div>
@@ -1837,7 +1838,8 @@ button:disabled{background-color:#a3b3d1;cursor:not-allowed}
   <div class="skai-section-body">
     <div class="skai-crowd-grid">
       <?php foreach ($recommendations as $play) :
-            $cs = $crowdScores[$play['id']] ?? ['label'=>'—','explanation'=>'—','under31'=>0];
+            $playId = $play['id'];
+            $cs = $crowdScores[$playId] ?? ['label'=>'—','explanation'=>'—','under31'=>0];
       ?>
       <div class="skai-crowd-item">
         <p class="skai-crowd-level"><?php echo htmlspecialchars($play['title'], ENT_QUOTES, 'UTF-8'); ?> &mdash; <?php echo htmlspecialchars((string)$cs['label'], ENT_QUOTES, 'UTF-8'); ?></p>
