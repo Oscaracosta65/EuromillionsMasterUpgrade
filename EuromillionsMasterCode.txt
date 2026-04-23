@@ -1,7 +1,7 @@
 {source}
 <?php
 /**
- * VERIFICATION SUMMARY
+ * VERIFICATION SUMMARY (PRODUCTION AUDIT PASS)
  * Target file: EuromillionsMasterCode.txt
  * Target game: EuroMillions — game ID 801
  * DB table: #__lotterydb_uk (from lottery_skip_config.json game 801 "dbCol")
@@ -10,17 +10,23 @@
  * Lucky Stars: 2 drawn from 1–12 (confirmed: num_extra_balls_drawn=2, max_extra_ball_number=12)
  * Extra ball columns: sixth (Star 1) AND seventh (Star 2) — both tracked
  * Jackpot odds: 1 in 139,838,160 (C(50,5)=2,118,760 × C(12,2)=66 — verified by calculation)
+ * All 13 prize-tier odds mathematically verified against C(50,5)×C(12,2)=139,838,160
  * Draw schedule: Every Tuesday and Friday (Paris, 20:00 CET)
  * Prize tiers: 13 verified tiers
  * Reference template: anhisLotteryMasterReference.txt used for PRESENTATION ONLY (not facts)
- * Factual corrections: ranges updated 41→50 (main) and 1→2 Lucky Stars (1–12 pool)
- * leGetPreviousOccurrenceDate updated: bonus checks sixth OR seventh
- * leFetchRecentDraws updated: includes seventh column
- * All recommendation plays updated: 2 Lucky Stars per play
- * leBuildCombinationProfile thresholds updated for 5/50 matrix
- * leCrowdRiskProfile thresholds updated for 1–50 range
- * AI prediction section preserved intact from original target file
- * Joomla 5.1.2 + PHP 8.1.31 compatible; ES5 JS; UTF-8; no BOM
+ *
+ * AUDIT CORRECTIONS APPLIED:
+ * 1. leResolveLogo: removed hardcoded 'us/' prefix — path now /images/lottodb/{state}/{name}.png
+ * 2. $drawHistoryRows: added 'ballValue' field (padded number only) for Lucky Stars to prevent
+ *    pill display overflow (label 'Lucky Star 1 (03)' overflowed the 34px pill)
+ * 3. PHP $labelText: changed single-quoted '\u2013' (literal) to actual en dash character '–'
+ * 4. Navigation links: changed '/all-us-lotteries/results-analysis' paths to page-internal anchors
+ *    (EuroMillions is a European lottery — /all-us-lotteries/ path is factually wrong)
+ * 5. Script placement: moved all <script>/[[script]] blocks before [[/body]][[/html]]
+ *    (scripts were incorrectly placed after [[/html]])
+ * 6. AI training: fixed extraVector encoding to mark BOTH Lucky Stars per draw (not just first)
+ *    — corrected in trainModelForBacktest AND main training loop
+ * Joomla 5.1.2 + PHP 8.1.31 compatible; ES5 JS (SKAI section); UTF-8; no BOM
  */
 
 use Joomla\CMS\Uri\Uri;
@@ -348,7 +354,7 @@ function leResolveLogo(string $stateAbrev, string $gName): array
 {
     $stateSlug   = strtolower(trim($stateAbrev));
     $lotterySlug = strtolower(str_replace(' ', '-', trim($gName)));
-    $rel = '/images/lottodb/us/' . $stateSlug . '/' . $lotterySlug . '.png';
+    $rel = '/images/lottodb/' . $stateSlug . '/' . $lotterySlug . '.png';
     $abs = rtrim(JPATH_ROOT, DIRECTORY_SEPARATOR) . $rel;
     if (is_file($abs)) {
         return ['url' => $rel, 'exists' => true];
@@ -932,19 +938,21 @@ if ($drawDate !== '') {
     $prevStar1 = leGetPreviousOccurrenceDate($db, $leDbCol, $gameId, $drawDate, $pb, true);
     $star1Ago  = leGetDrawingsSinceDate($db, $leDbCol, $gameId, $prevStar1, $drawDate);
     $drawHistoryRows[] = [
-        'label'    => 'Lucky Star 1 (' . lePad2($pb) . ')',
-        'prevDate' => $prevStar1,
-        'drawsAgo' => $star1Ago,
-        'isBonus'  => true,
+        'label'     => 'Lucky Star 1',
+        'ballValue' => lePad2($pb),
+        'prevDate'  => $prevStar1,
+        'drawsAgo'  => $star1Ago,
+        'isBonus'   => true,
     ];
     // Lucky Star 2 (seventh)
     $prevStar2 = leGetPreviousOccurrenceDate($db, $leDbCol, $gameId, $drawDate, $pb2, true);
     $star2Ago  = leGetDrawingsSinceDate($db, $leDbCol, $gameId, $prevStar2, $drawDate);
     $drawHistoryRows[] = [
-        'label'    => 'Lucky Star 2 (' . lePad2($pb2) . ')',
-        'prevDate' => $prevStar2,
-        'drawsAgo' => $star2Ago,
-        'isBonus'  => true,
+        'label'     => 'Lucky Star 2',
+        'ballValue' => lePad2($pb2),
+        'prevDate'  => $prevStar2,
+        'drawsAgo'  => $star2Ago,
+        'isBonus'   => true,
     ];
 }
 
@@ -1502,9 +1510,9 @@ button:disabled{background-color:#a3b3d1;cursor:not-allowed}
           <a href="#ai-tool"   class="skai-btn skai-btn--secondary">AI Analysis &darr;</a>
         </div>
         <div class="skai-advanced-links" style="margin-top:10px">
-          <a class="skai-mini-link" href="/all-us-lotteries/results-analysis?gm=<?php echo urlencode($leGName); ?>#frequency">Frequency</a>
-          <a class="skai-mini-link" href="/all-us-lotteries/results-analysis?gm=<?php echo urlencode($leGName); ?>#recency">Recency</a>
-          <a class="skai-mini-link" href="/all-us-lotteries/results-analysis?gm=<?php echo urlencode($leGName); ?>#overview">Overview</a>
+          <a class="skai-mini-link" href="#frequency">Frequency</a>
+          <a class="skai-mini-link" href="#recency">Recency</a>
+          <a class="skai-mini-link" href="#overview">Overview</a>
         </div>
       </div>
     </div>
@@ -1900,13 +1908,13 @@ button:disabled{background-color:#a3b3d1;cursor:not-allowed}
             <div>
               <p class="skai-history-name">
                 <?php if ($dhr['isBonus']) : ?>
-                  <span class="skai-pill skai-pill--bonus"><?php echo htmlspecialchars(lePad2((string)$dhr['label']), ENT_QUOTES, 'UTF-8'); ?></span>
+                  <span class="skai-pill skai-pill--bonus"><?php echo htmlspecialchars((string)($dhr['ballValue'] ?? lePad2((string)$dhr['label'])), ENT_QUOTES, 'UTF-8'); ?></span>
                 <?php else : ?>
-                  <span class="skai-pill skai-pill--main"><?php echo htmlspecialchars(lePad2((string)$dhr['label']), ENT_QUOTES, 'UTF-8'); ?></span>
+                  <span class="skai-pill skai-pill--main"><?php echo htmlspecialchars((string)($dhr['ballValue'] ?? lePad2((string)$dhr['label'])), ENT_QUOTES, 'UTF-8'); ?></span>
                 <?php endif; ?>
               </p>
               <p class="skai-history-date">
-                <?php echo $dhr['isBonus'] ? 'Lucky Star' : 'Main Number'; ?> &bull;
+                <?php echo $dhr['isBonus'] ? htmlspecialchars((string)$dhr['label'], ENT_QUOTES, 'UTF-8') : 'Main Number'; ?> &bull;
                 Prev: <?php echo htmlspecialchars(leFmtDate($dhr['prevDate'] ?? null), ENT_QUOTES, 'UTF-8'); ?>
               </p>
             </div>
@@ -2190,10 +2198,10 @@ button:disabled{background-color:#a3b3d1;cursor:not-allowed}
       </div>
     </div>
     <div class="skai-utility-grid" style="margin-top:14px">
-      <a class="skai-utility-link" href="/all-us-lotteries/results-analysis?gm=<?php echo urlencode($leGName); ?>#frequency">Frequency</a>
-      <a class="skai-utility-link" href="/all-us-lotteries/results-analysis?gm=<?php echo urlencode($leGName); ?>#recency">Recency</a>
-      <a class="skai-utility-link" href="/all-us-lotteries/results-analysis?gm=<?php echo urlencode($leGName); ?>#tables">Tables</a>
-      <a class="skai-utility-link" href="/all-us-lotteries/results-analysis?gm=<?php echo urlencode($leGName); ?>#odds">Odds</a>
+      <a class="skai-utility-link" href="#frequency">Frequency</a>
+      <a class="skai-utility-link" href="#recency">Recency</a>
+      <a class="skai-utility-link" href="#tables">Tables</a>
+      <a class="skai-utility-link" href="#odds">Odds</a>
     </div>
   </div>
 </section>
@@ -2446,7 +2454,7 @@ button:disabled{background-color:#a3b3d1;cursor:not-allowed}
       [[input type="hidden" name="activation_function" id="saveActivationFunction"]]
       [[input type="hidden" name="hidden_layers" id="saveHiddenLayers"]]
       [[label style="display:block;font-weight:bold;margin:6px 0 2px;"]]Label[[/label]]
-      <?php $labelText = $lotteryName . ' Prediction \u2013 ' . date('M j, Y'); ?>
+      <?php $labelText = $lotteryName . ' Prediction – ' . date('M j, Y'); ?>
       [[input type="text" name="label" id="saveLabel" value="<?php echo htmlspecialchars($labelText, ENT_QUOTES, 'UTF-8'); ?>" style="width:100%;"]]
       <?php if ($userCanSave): ?>
         [[button type="submit" name="save_set" style="margin-top:10px;padding:7px 15px;background-color:#007bff;color:#fff;border:none;border-radius:5px;font-weight:bold;font-size:13px;"]]
@@ -2537,9 +2545,6 @@ button:disabled{background-color:#a3b3d1;cursor:not-allowed}
     Lotteries are fun but unpredictable. AI and wheeling strategies provide better structure, but no one can guarantee a jackpot. Always play responsibly.
   [[/p]]
 [[/section]]
-
-[[/body]]
-[[/html]]
 
 <script>
 /* ======================================================
@@ -2946,9 +2951,11 @@ document.addEventListener('DOMContentLoaded', function() {
       mainNumbers.forEach(function(num) { mainNumbersVector[num - 1] = 1; });
       ys_main.push(mainNumbersVector);
       if (hasExtraBall) {
-        var extraNumber = nextDraw[pickSize];
         var extraVector = new Array(extraBallMax).fill(0);
-        extraVector[extraNumber - 1] = 1;
+        for (var e = 0; e < numExtraBalls; e++) {
+          var en = nextDraw[pickSize + e];
+          if (en > 0 && en <= extraBallMax) { extraVector[en - 1] = 1; }
+        }
         ys_extra.push(extraVector);
       }
     }
@@ -3074,9 +3081,11 @@ document.addEventListener('DOMContentLoaded', function() {
         mns.forEach(function(num) { mnv[num - 1] = 1; });
         ys_main.push(mnv);
         if (hasExtraBall) {
-          var en = nxt[pickSize];
           var ev = new Array(extraBallMax).fill(0);
-          ev[en - 1] = 1;
+          for (var e = 0; e < numExtraBalls; e++) {
+            var enVal = nxt[pickSize + e];
+            if (enVal > 0 && enVal <= extraBallMax) { ev[enVal - 1] = 1; }
+          }
           ys_extra.push(ev);
         }
       }
@@ -3190,5 +3199,8 @@ document.addEventListener('DOMContentLoaded', function() {
   });
 });
 [[/script]]
+
+[[/body]]
+[[/html]]
 
 {/source}
