@@ -836,6 +836,15 @@ foreach ($starChartLabels as $label) {
     $starChartValues[] = (int) ($starCounts[$label] ?? 0);
 }
 
+// ── Chart data bundle (passed to SKAI JS charts) ──────────────────────────────
+$chartData = [
+    'mainLabels'        => $mainChartLabels,
+    'mainValues'        => $mainChartValues,
+    'mainRecencyValues' => $mainRecencyValues,
+    'starLabels'        => $starChartLabels,
+    'starValues'        => $starChartValues,
+];
+
 // ── Top active / quietest (main) ───────────────────────────────────────────────
 $topActiveKeys = leTopKeysByValue($mainCounts, 10, false);
 $topQuietKeys  = leTopKeysByValue($mainCounts, 10, true);
