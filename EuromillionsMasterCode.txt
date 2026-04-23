@@ -1,0 +1,2257 @@
+{source}
+<?php
+use Joomla\CMS\Uri\Uri;
+
+// Canonical tag (ensures correct indexing)
+$canonicalUrl = Uri::getInstance()->toString();
+echo '<link rel="canonical" href="' . htmlspecialchars($canonicalUrl) . '" />' . "\n";
+
+// Hreflang setup for generic English + fallback
+$pathWithQuery = Uri::getInstance()->toString(['path', 'query']);
+$href = 'https://lottoexpert.net' . $pathWithQuery;
+
+echo '<link rel="alternate" hreflang="en" href="' . $href . '" />' . "\n";
+echo '<link rel="alternate" hreflang="x-default" href="' . $href . '" />' . "\n";
+
+
+// PREVENT UNAUTHORIZED ACCESS ASAP
+defined('_JEXEC') or die('Restricted access');
+
+// Include Joomla authentication early
+include '../joomla-auth.php';
+
+// Define Joomla constants if not already set
+if (!defined('JPATH_BASE')) {
+    define('JPATH_BASE', realpath(dirname(__FILE__) . '/../..'));
+}
+if (!defined('_JEXEC')) {
+    define('_JEXEC', 1);
+}
+
+// Load Joomla Framework
+require_once JPATH_BASE . '/includes/defines.php';
+require_once JPATH_BASE . '/includes/framework.php';
+
+/**
+ * Single source of truth for the Lottery Game ID.
+ * Change this one value, and all lookups will use it.
+ */
+$gameId = '801';   // ← YOUR ONLY GAME ID DEFINITION
+
+$app = JFactory::getApplication('site');
+
+$db = JFactory::getDbo(); // ✅ Unified DB access
+
+// Get the current user BEFORE processing the save request
+$currUser     = JFactory::getUser();
+$userGroups   = $currUser->groups ?? [];
+// ── Permissions: who may RUN vs SAVE ──
+// Run allowed for groups: 1, 2, 10, 12, 13, 14
+$allowedRunGroups  = [1, 2, 10, 12, 13, 14];
+if ($currUser->guest) {
+    // treat guests as “Public” (group 1)
+    $userCanRun = in_array(1, $allowedRunGroups, true);
+} else {
+$userCanRun        = (bool) array_intersect($allowedRunGroups, $userGroups);
+}
+// Save allowed for groups: 2, 8, 10, 12, 14
+$allowedSaveGroups = [2, 8, 10, 12, 14];
+$userCanSave       = (bool) array_intersect($allowedSaveGroups, $userGroups);
+
+/**
+ * Retrieve the next upcoming draw_date for a given lottery.
+ *
+ * @param   string $gameId     The lottery’s game ID (e.g. '101').
+ * @param   string $stateAbbr  Two‑letter lower‑cased state abbreviation (e.g. 'fl').
+ * @param   object $db         Joomla database object.
+ * @return  string|null        Next draw_date (YYYY‑MM‑DD) or null if none.
+ */
+
+// ─── LOAD LOTTERIES.JSON & DETERMINE tableName ───────────────────
+$specsFile = realpath('/home/oscara/web/lottoexpert.net/public_html/lotteries.json');
+if (!$specsFile || !is_readable($specsFile)) {
+    die('Lottery specs file not found or unreadable.');
+}
+$specsContent = file_get_contents($specsFile);
+$specsData = json_decode($specsContent, true);
+if (json_last_error() !== JSON_ERROR_NONE) {
+    die('Error parsing lotteries.json: ' . json_last_error_msg());
+}
+
+$foundSpec = null;
+foreach ($specsData['lotteries'] as $lot) {
+    if ((string)$lot['gameId'] === (string)$gameId) {
+        $foundSpec = $lot;
+        break;
+    }
+}
+if (!$foundSpec) {
+    die("Lottery spec for game ID $gameId not found in lotteries.json");
+}
+
+
+// THIS is the exact DB table from your JSON:
+$tableName = $foundSpec['tableName'];  // e.g. "#__lotterydb_pa"
+
+
+// ── DEBUG: show us exactly what table we're about to hit ──
+
+if ($app->get('debug')) {
+    echo '<pre style="background:#fee; padding:1em">';
+    echo "RAW placeholder:     " . $tableName . "\n";
+    echo "DB prefix:           " . $db->getPrefix() . "\n";
+    echo "Expanded full name:  " . $db->replacePrefix($tableName) . "\n";
+    echo '</pre>';
+    exit;
+}
+
+// ─── NEW getNextDrawDate() ─────────────────────────────────────
+/**
+ * Retrieves the next draw_date from the JSON‑driven tableName.
+ */
+function getNextDrawDate($gameId, $db, $tableName) {
+    $query = $db->getQuery(true)
+        ->select($db->quoteName('next_draw_date'))
+        ->from(  $db->quoteName($tableName))
+        ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
+        ->order($db->quoteName('draw_date') . ' DESC')
+        ->setLimit(1);
+    $db->setQuery($query);
+    return $db->loadResult();
+}
+
+
+// PROCESS SAVE PREDICTION SET (Place after current user is loaded, before any HTML output)
+if ($_SERVER['REQUEST_METHOD'] === 'POST'
+    && JSession::checkToken()
+    && isset($_POST['save_set'])
+) {
+    // ── GUARD #1 …
+    if (! $userCanSave) {
+        $app->enqueueMessage('You don’t have permission to save predictions.', 'error');
+        $app->redirect('/my-dashboard');
+        exit;
+    }
+
+    // ── GUARD #2 …
+    $rawMain = trim($_POST['main_numbers'] ?? '');
+    if ($rawMain === '') {
+        $app->enqueueMessage(
+            'No prediction data—please run analysis before saving.',
+            'error'
+        );
+        $app->redirect('/my-dashboard');
+        exit;
+    }
+
+    // ── your existing sanitization & INSERT logic starts here:
+    $lottery = filter_input(INPUT_POST, 'lottery_id', FILTER_VALIDATE_INT);
+$src     = $db->quote(strip_tags(trim($_POST['source'])));
+$lbl     = $db->quote(strip_tags(trim($_POST['label'])));
+$main    = $db->quote(strip_tags(trim($_POST['main_numbers'])));
+$extra   = $db->quote(strip_tags(trim($_POST['extra_ball_numbers'])));
+$count   = filter_input(INPUT_POST, 'draws_analyzed', FILTER_VALIDATE_INT);
+$gen     = $db->quote(strip_tags(trim($_POST['generated_at'])));
+$saved   = $db->quote(date('Y-m-d H:i:s'));
+$epochs     = (int) $_POST['epochs'];
+$batchSize  = (int) $_POST['batch_size'];
+$dropout    = (float) $_POST['dropout_rate'];
+$lr         = (float) $_POST['learning_rate'];
+$actFunc    = $db->quote(strip_tags(trim($_POST['activation_function'])));
+$layers     = (int) $_POST['hidden_layers'];
+
+
+    // → lookup the Joomla lottery PK by game_id (no state abbreviations)
+    $q = $db->getQuery(true)
+        ->select('l.game_id')
+        ->from( $db->quoteName('#__lotteries','l') )
+        ->where('l.lottery_id = ' . $lottery);
+    $db->setQuery($q);
+    $gameDbId = $db->loadResult();
+
+    // → fetch next draw_date using our JSON‑driven $tableName
+    $nextDraw = getNextDrawDate($gameDbId, $db, $tableName);
+
+
+// build the query exactly as getNextDrawDate does
+$query = $db->getQuery(true)
+    ->select($db->quoteName('next_draw_date'))
+    ->from(  $db->quoteName($tableName))
+    ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameDbId))
+    ->order($db->quoteName('draw_date') . ' DESC')
+    ->setLimit(1);
+
+
+    // → build INSERT with next_draw_date column
+    $ins = $db->getQuery(true)
+        ->insert($db->quoteName('#__user_saved_numbers'))
+        ->columns([
+  'user_id','lottery_id','main_numbers','extra_ball_numbers',
+  'source','label','draws_analyzed','generated_at','date_saved',
+  'next_draw_date', 'epochs', 'batch_size', 'dropout_rate',
+  'learning_rate', 'activation_function', 'hidden_layers'
+])
+        ->values(
+  (int)$currUser->id . ", $lottery, $main, $extra, "
+  . "$src, $lbl, $count, $gen, $saved, "
+  . $db->quote($nextDraw) . ", $epochs, $batchSize, $dropout, $lr, $actFunc, $layers"
+);
+
+    try {
+        $db->setQuery($ins);
+        $db->execute();
+        $app->enqueueMessage('Number set saved successfully.');
+        $app->redirect('/my-dashboard');
+        exit;
+    } catch (Exception $e) {
+        $app->enqueueMessage('Error saving number set: ' . $e->getMessage(), 'error');
+    }
+}
+
+// — The rest of your file (re‑initialization, JSON config read, the full HTML/CSS/JS) stays exactly the same. — 
+// Paste the remainder of your original file here without changes.
+
+
+// Get the application instance
+$app = \JFactory::getApplication('site');
+
+
+// Prevent direct access to the file
+defined('_JEXEC') or die('Restricted access');
+
+// Path to the JSON settings file
+$configFile = '/home/oscara/web/lottoexpert.net/public_html/settings2.json';
+
+// Check if the file exists
+if (!file_exists($configFile)) {
+    die('Configuration file not found.');
+}
+
+// Read and decode the JSON configuration
+$configContent = file_get_contents($configFile);
+$config = json_decode($configContent, true);
+
+// Check for JSON parsing errors
+if (json_last_error() !== JSON_ERROR_NONE) {
+    die('Error parsing configuration file: ' . json_last_error_msg());
+}
+
+
+// Ensure the game ID exists in the configuration
+if (!isset($config[$gameId])) {
+    die("Game ID $gameId not found in the configuration.");
+}
+
+// Lookup the Joomla lotteries.lottery_id by that game_id so we pass the correct PK into our save handler
+
+$queryLottery = $db->getQuery(true)
+    ->select($db->quoteName('lottery_id'))
+    ->from($db->quoteName('#__lotteries'))
+    ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId));
+$db->setQuery($queryLottery);
+$lottery_id = (int)$db->loadResult();
+
+// Load the game‑specific settings
+$gameConfig        = $config[$gameId];
+$epochs            = $gameConfig['epochs']            ?? null;
+$batchSize         = $gameConfig['batchSize']         ?? null;
+$dropoutRate       = $gameConfig['dropoutRate']       ?? null;
+$learningRate      = $gameConfig['learningRate']      ?? null;
+$activationFunction= $gameConfig['activationFunction']?? null;
+$hiddenLayers      = $gameConfig['hiddenLayers']      ?? null;
+
+// Validate extracted parameters...
+if (!is_numeric($epochs) || $epochs <= 0) {
+    die('Invalid value for "epochs". Must be a positive number.');
+}
+if (!is_numeric($batchSize) || $batchSize <= 0) {
+    die('Invalid value for "batchSize". Must be a positive number.');
+}
+if (!is_numeric($dropoutRate) || $dropoutRate < 0 || $dropoutRate > 1) {
+    die('Invalid value for "dropoutRate". Must be between 0 and 1.');
+}
+if (!is_numeric($learningRate) || $learningRate <= 0) {
+    die('Invalid value for "learningRate". Must be greater than 0.');
+}
+if (!in_array($activationFunction, ['relu','sigmoid','tanh'], true)) {
+    die('Invalid value for "activationFunction".');
+}
+if (!is_numeric($hiddenLayers) || $hiddenLayers <= 0) {
+    die('Invalid value for "hiddenLayers". Must be a positive number.');
+}
+
+
+// Map the JSON fields into our variables
+$mainNumbersMax = (int) $foundSpec['rangeMain'];       // e.g. 70
+$pickSize       = (int) $foundSpec['pickSize'];        // e.g. 5 or 6
+$numExtraBalls  = (int) $foundSpec['extraBallCount'];   // 0, 1, or 2
+$hasExtraBall   = $numExtraBalls > 0;
+$extraBallMax   = $hasExtraBall
+                    ? (int) $foundSpec['rangeExtra']
+                    : 0;                               // e.g. 25
+
+
+// ── HARD‑CODED COLUMN NAMES & SLICING ──
+
+// We’ve locked these in for security; we’ll only ever use the first $pickSize
+// (plus any extra balls) out of this master list:
+$allNumberFields = [
+  'first','second','third','fourth','fifth','sixth','seventh',
+  'eighth','nineth','tenth','eleventh','twelveth','thirtheenth',
+  'fourteenth','fifteenth','sixteenth','seventeenth','eighteenth',
+  'nineteenth','twentieth','twenty_first','twenty_second'
+];
+
+// pick the columns for the main draw:
+$mainFieldNames  = array_slice($allNumberFields, 0, $pickSize);
+
+// pick the columns for any extra‑ball(s) (will be empty if none):
+$extraFieldNames = $hasExtraBall
+    ? array_slice($allNumberFields, $pickSize, $numExtraBalls)
+    : [];
+// ── end HARD‑CODED COLUMN NAMES ──
+
+// (A) Helper to compute “n choose k”
+function combination($n, $k) {
+    if ($k > $n) return 0;
+    $res = 1;
+    for ($i = 1; $i <= $k; $i++) {
+        $res = $res * ($n - $i + 1) / $i;
+    }
+    return round($res);
+}
+
+// (B) Total ways to pick $pickSize from $mainNumbersMax
+$totalCombinations = combination($mainNumbersMax, $pickSize);
+
+// ── DYNAMIC BUCKETS BLOCK START ──
+
+// 1) grab any custom from GET/POST
+$custom = isset($_REQUEST['customCount']) ? (int)$_REQUEST['customCount'] : null;
+
+// 2) build the raw list: always include 1 ticket, stock buckets, and custom
+$raw = [
+  $pickSize,  // “1 ticket”
+  10, 15, 20, // stock buckets
+  $custom     // optional custom
+];
+
+// 3) filter invalid, dedupe & sort
+$options = array_values(array_unique(array_filter($raw, function($n) use($pickSize, $mainNumbersMax) {
+    return is_int($n)
+        && $n >= $pickSize
+        && $n <= $mainNumbersMax;
+})));
+sort($options);
+
+// 4) build stats
+$stats = [];
+foreach ($options as $opt) {
+    $ways = combination($opt, $pickSize);
+    $odds = $ways ? round($totalCombinations / $ways) : 0;
+    $stats[] = [
+      'count' => $opt,
+      'ways'  => $ways,
+      'odds'  => $odds,
+      'pct'   => $ways
+                 ? round(100 * $ways / $totalCombinations, 2)
+                 : 0,
+    ];
+}
+$best = end($stats);
+
+// ── DYNAMIC BUCKETS BLOCK END ──
+
+
+// (D) Build stats for each option: ways, odds, coverage %
+$stats = [];
+foreach ($options as $opt) {
+    $ways = combination($opt, $pickSize);
+    $odds = $ways ? round($totalCombinations / $ways) : 0;
+    $stats[] = [
+        'count' => $opt,
+        'ways'  => $ways,
+        'odds'  => $odds,
+        'pct'   => $ways
+                   ? round(100 * $ways / $totalCombinations, 2)
+                   : 0
+    ];
+}
+
+// (E) Grab the “best” (last) row for headlines
+$best = end($stats);
+
+
+// Securely connect to the Joomla database
+
+$dbCol = $db->quoteName($foundSpec['tableName']);
+
+$gameIdCol = $db->quoteName('game_id');
+$drawDateCol = $db->quoteName('draw_date');
+
+// Prepare the SQL query securely
+$query = $db->getQuery(true)
+    ->select('*') // Include the game_name field
+    ->from($dbCol)
+    ->where($gameIdCol . ' = ' . $db->quote($gameId))
+    ->order($drawDateCol . ' ASC');
+
+$db->setQuery($query);
+$historicalResults = $db->loadObjectList();
+
+// Extract the lottery name from the database or default to 'Lottery' if not found
+$lotteryName = isset($historicalResults[0]->game_name) ? $historicalResults[0]->game_name : 'Lottery';
+
+// Count the total number of database entries
+$totalEntryCount = count($historicalResults);
+
+// Initialize variables
+$draws = [];
+$nearestDrawNumbers = [];
+$nearestDrawDate = '';
+
+// ───────────────────────────────────────────────────────────────
+// Use the actual last draw_date from the DB instead of today
+if (!empty($historicalResults)) {
+    // $historicalResults is ordered by draw_date ASC
+    $lastRow        = end($historicalResults);
+    $latestDrawDate = date('Y-m-d', strtotime($lastRow->draw_date));
+} else {
+    // Fallback if no history present
+    $latestDrawDate = date('Y-m-d');
+}
+// ───────────────────────────────────────────────────────────────
+
+if (!empty($historicalResults)) {
+    foreach ($historicalResults as $lr) {
+        // Collect historical draw numbers and date
+
+// build the numbers array dynamically based on our slices
+$numbers = [];
+// main balls
+foreach ($mainFieldNames as $col) {
+  $numbers[] = intval($lr->{$col});
+}
+// extra ball(s)
+foreach ($extraFieldNames as $col) {
+  $numbers[] = intval($lr->{$col});
+}
+
+        $draws[] = [
+            'numbers'   => $numbers,
+            'draw_date' => $lr->draw_date
+        ];
+    }
+
+    // Use the latest draw as the input for Analysis
+    $latestDrawData      = end($draws);
+    $latestResult        = $latestDrawData['numbers'];
+    $latestDrawDateFromDB = date('Y-m-d', strtotime($latestDrawData['draw_date']));
+
+    // Find the draw nearest to the selected date
+    $selectedDrawDate = isset($_POST['latestDrawDate'])
+        ? $_POST['latestDrawDate']
+        : $latestDrawDate;  // now correctly set from DB
+    $nearestDraw = null;
+
+    foreach ($draws as $draw) {
+        if (new DateTime($draw['draw_date']) <= new DateTime($selectedDrawDate)) {
+            $nearestDraw = $draw;
+        } else {
+            break;
+        }
+    }
+
+    if ($nearestDraw) {
+        $nearestDrawNumbers = $nearestDraw['numbers'];
+        $nearestDrawDate    = $nearestDraw['draw_date'];
+    }
+}
+
+?>
+
+[[!DOCTYPE html]]
+[[html]]
+[[head]]
+  [[meta charset="UTF-8"]]
+  [[title]]AI-Powered Lottery Prediction Analysis for <?php echo htmlspecialchars($lotteryName, ENT_QUOTES, 'UTF-8'); ?>[[/title]]
+  [[script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"]][[/script]]
+  [[link href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700" rel="stylesheet"]]
+
+[[style]]
+/* Global styles */
+body {
+  font-family: 'Roboto', Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  background-color: #f7f9fc;
+  color: #333;
+  margin: 0;
+  padding: 0;
+}
+
+/* Main container for analysis module */
+.ai-powerball-prediction {
+  background-color: #ffffff;
+  border: 1px solid #c7d1e0;
+  border-radius: 8px;
+  padding: 30px;
+  text-align: center;
+  margin: 30px auto;
+  max-width: 900px;
+}
+
+/* Headings */
+.ai-powerball-prediction h2 {
+  font-size: 32px;
+  font-weight: bold;
+  margin-bottom: 20px;
+  color: #2a5298;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.ai-powerball-prediction h3 {
+  font-size: 24px;
+  font-weight: 500;
+  margin-top: 20px;
+  margin-bottom: 15px;
+  color: #fff;
+}
+.ai-powerball-prediction h4 {
+  font-size: 24px;
+  font-weight: 500;
+  margin-top: 20px;
+  margin-bottom: 15px;
+  color: #2a5298;
+}
+/* Buttons */
+button {
+  padding: 10px 20px;
+  font-size: 16px;
+  background-color: #2a5298;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-top: 10px;
+}
+
+button:hover {
+  background-color: #254a85;
+}
+
+button:disabled {
+  background-color: #a3b3d1;
+  cursor: not-allowed;
+}
+
+/* Parameter inputs styling */
+.parameter-inputs {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 20px;
+  margin-top: 20px;
+}
+
+.parameter-inputs .parameter-item {
+  flex: 1 1 200px;
+  margin: 10px;
+}
+
+.parameter-inputs label {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 5px;
+}
+
+.parameter-inputs input,
+.parameter-inputs select {
+  padding: 8px;
+  border-radius: 4px;
+  border: 1px solid #c7d1e0;
+  width: 100%;
+}
+
+/* Countdown and progress message */
+.countdown {
+  font-size: 18px;
+  font-weight: bold;
+  margin-top: 15px;
+  color: #2a5298;
+}
+
+/* Parameter display box */
+#parameterDisplay {
+  background-color: #2a5298;
+  color: #fff;
+  padding: 10px;
+  border-radius: 4px;
+  margin-top: 20px;
+  font-size: 14px;
+}
+
+.parameterDisplayItem {
+  display: inline-block;
+  margin: 5px 20px;
+}
+
+.parameterDisplayItem label {
+  font-weight: bold;
+  color: #a9d1ff;
+}
+
+.parameterDisplayItem span {
+  color: #feee00;
+  font-weight: bold;
+}
+
+/* Number ball styling */
+.number-ball {
+  display: inline-block;
+  padding: 0;
+  border-radius: 50%;
+  background-color: #ffffff;
+  color: #2a5298;
+  width: 60px;
+  height: 60px;
+  line-height: 60px;
+  font-size: 24px;
+  font-weight: bold;
+  text-align: center;
+  margin: 10px 5px;
+  box-shadow: 0px 2px 6px rgba(0, 0, 0, 0.1);
+  border: 2px solid #c7d1e0;
+}
+
+.number-ball.powerball {
+  background-color: #2a5298;
+  color: #ffffff;
+  border-color: #254a85;
+  box-shadow: 0px 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+/* Highlighting for matching numbers in backtesting */
+.match {
+  background-color: #feee00;
+  color: #000;
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-weight: bold;
+}
+
+/* Loading animation */
+.loading .fun-message {
+  font-size: 16px;
+  margin-bottom: 10px;
+}
+
+.loading .spinner {
+  border: 4px solid #f3f3f3;
+  border-top: 4px solid #2a5298;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+  margin: 0 auto;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* Progress bar */
+.progress-bar-container {
+  background-color: #e0e7ed;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 10px;
+  width: 100%;
+}
+
+.progress-bar {
+  background-color: #f77400;
+  height: 20px;
+  width: 0%;
+  text-align: center;
+  color: #fff;
+  line-height: 20px;
+  transition: width 0.5s;
+}
+
+/* Analysis result section */
+#prediction {
+  margin-top: 20px;
+  display: none;
+}
+
+#prediction h3 {
+  text-align: center;
+  color: #2a5298;
+}
+
+#predictedNumbers {
+  display: flex !important;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 20px;
+}
+
+/* Breakdown section */
+.breakdown-section {
+  background-color: #ffffff;
+  color: #333;
+  padding: 20px;
+  border-radius: 8px;
+  margin-top: 20px;
+  border: 1px solid #c7d1e0;
+}
+
+.breakdown-section h3 {
+  margin-bottom: 15px;
+  color: #2a5298;
+}
+
+.breakdown-section table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.breakdown-section th, .breakdown-section td {
+  border: 1px solid #c7d1e0;
+  padding: 8px;
+  text-align: center;
+}
+
+.breakdown-section th {
+  background-color: #2a5298;
+  color: #fff;
+}
+
+/* Custom container for detailed explanations */
+.custom-container {
+  font-size: 14px;
+  line-height: 1.6;
+  text-align: left;
+  max-width: 600px;
+  margin: 20px auto;
+  padding: 20px;
+  background-color: #ffffff;
+  border: 1px solid #c7d1e0;
+  border-radius: 8px;
+}
+
+/* Explanation section */
+.explanation-section {
+  background-color: #ffffff;
+  color: #333;
+  padding: 20px;
+  border-radius: 8px;
+  margin-top: 20px;
+  font-size: 14px;
+  line-height: 1.8;
+  border: 1px solid #c7d1e0;
+}
+
+/* Backtesting notice and results */
+#backtestNotice, #backtestResults {
+  background-color: #ffffff;
+  color: #333;
+  padding: 15px;
+  border-radius: 4px;
+  margin-top: 20px;
+  border: 1px solid #c7d1e0;
+}
+
+#backtestProgressContainer {
+  margin-top: 10px;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .parameter-inputs {
+    flex-direction: column;
+    align-items: center;
+  }
+  .parameter-item {
+    width: 100%;
+    max-width: 300px;
+  }
+  
+  /* Tile styling (darker background for better separation) */
+  .tile {
+    background: #e9eef5;           /* slightly darker than pure white */
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    padding: 1em;
+    margin: 1.5em 0;
+  }
+  /* Compact charts */
+  .tile canvas {
+    width: 100% !important;
+    height: 200px !important;
+  }
+  /* Tight tables */
+  .tile table {
+    margin: 0;
+  }
+  .tile th, .tile td {
+    padding: 6px;
+    font-size: 0.9em;
+  }
+
+
+[[/style]]
+[[/head]]
+[[body]]
+  [[div class="ai-powerball-prediction"]]
+    [[h2]]AI-Powered Lottery Prediction Analysis for <?php echo htmlspecialchars($lotteryName, ENT_QUOTES, 'UTF-8'); ?>[[/h2]]
+    [[p]]Take full control of your AI-powered prediction analysis for the <?php echo htmlspecialchars($lotteryName, ENT_QUOTES, 'UTF-8'); ?> and explore the best settings for you![[/p]]
+    
+    <!-- Start Analysis Buttons -->
+    <?php if ($userCanRun): ?>
+      [[div style="text-align: center; margin-top: 20px;"]]
+        [[button id="startPrediction" type="button" style="padding: 10px 20px; background-color: #3498db; color: white; border: none; border-radius: 5px; cursor: pointer;"]]
+          Start Analysis
+        [[/button]]
+        [[button onclick="location.reload()" type="button" style="padding: 10px 20px; background-color: #e74c3c; color: white; border: none; border-radius: 5px; cursor: pointer; margin-left: 10px;"]]
+          Reset
+        [[/button]]
+      [[/div]]
+    <?php else: ?>
+      [[div style="text-align: center; margin-top: 20px;"]]
+        [[button type="button" style="padding: 10px 20px; background-color: #3498db; color: white; border: none; border-radius: 5px; cursor: pointer;" onclick="showSignUpPopup()"]]
+          Start Analysis
+        [[/button]]
+        [[button type="button" style="padding: 10px 20px; background-color: #e74c3c; color: white; border: none; border-radius: 5px; cursor: pointer; margin-left: 10px;" onclick="showSignUpPopup()"]]
+          Reset
+        [[/button]]
+      [[/div]]
+      [[script]]
+        function showSignUpPopup() {
+          alert("This feature is available for registered members only. Sign up today to unlock all features!\n\nAvailable Subscription:\n  AI Insights: Unlock advanced AI-driven lottery analysis and personalized updates, giving you a strategic edge in every game. Visit https://lottoexpert.net/lottoexpert-subscriptions to choose your plan.");
+        }
+      [[/script]]
+    <?php endif; ?>
+    
+    <!-- Advanced Backtesting Section (moved below the Start Analysis buttons) -->
+    [[div style="margin: 20px auto; padding: 10px; background: #f9f9f9; color: #333; border-radius: 5px; width: 60%; border: 1px solid #ddd; text-align: left; font-size: 14px;"]]
+      [[h4]]Backtesting (Optional)[[/h4]]
+      [[p]]
+        Optionally enable backtesting to evaluate how your chosen settings would have performed on past draws. 
+        This feature helps you analyze historical trends and refine your strategy without affecting your current analysis.
+      [[/p]]
+      [[label for="enableBacktest"]]
+        [[input type="checkbox" id="enableBacktest" name="enableBacktest" style="margin-right: 8px;" /]]
+        Enable Backtest
+      [[/label]]
+      [[label for="numDrawsBacktest"]]
+  Select Number of Draws for Backtest:
+  [[select id="numDrawsBacktest" name="numDrawsBacktest"]]
+    [[option value="1"]]1 Draw[[/option]]
+    [[option value="2"]]2 Draws[[/option]]
+    [[option value="3"]]3 Draws[[/option]]
+    [[option value="4"]]4 Draws[[/option]]
+    [[option value="5"]]5 Draws[[/option]]
+  [[/select]]
+[[/label]]
+    [[/div]]
+    
+    [[p]]Click "Start Analysis" to begin, or adjust the advanced settings below to customize your experience.[[/p]]
+    [[p]]Analyzing from [[strong]]<?php echo $totalEntryCount; ?>[[/strong]] total database entries...[[/p]]
+    
+    [[div class="custom-container"]]
+      [[details]]
+        [[summary]]Training Parameters Explained[[/summary]]
+        [[h4 style="margin-top: 10px;"]]Epochs[[/h4]]
+        [[p]][[strong]]Definition:[[/strong]] An epoch is one complete pass through the entire dataset.[[/p]]
+        [[p]][[strong]]Typical Range:[[/strong]] 10 to 1000.[[/p]]
+        [[ul style="padding-left: 20px; margin-top: 5px;"]]
+          [[li]]Increasing epochs can help the model learn more patterns but may cause overfitting.[[/li]]
+          [[li]]Decreasing epochs speeds training but may underfit the data.[[/li]]
+        [[/ul]]
+        [[h4 style="margin-top: 10px;"]]Batch Size[[/h4]]
+        [[p]][[strong]]Definition:[[/strong]] How many samples are processed at once before updating the model.[[/p]]
+        [[p]][[strong]]Typical Range:[[/strong]] 8 to 256.[[/p]]
+        [[ul style="padding-left: 20px; margin-top: 5px;"]]
+          [[li]]Larger batch sizes speed up training but may miss finer details.[[/li]]
+          [[li]]Smaller batches are more precise but slower.[[/li]]
+        [[/ul]]
+        [[h4 style="margin-top: 10px;"]]Dropout Rate[[/h4]]
+        [[p]][[strong]]Definition:[[/strong]] The fraction of neurons randomly ignored during training to prevent overfitting.[[/p]]
+        [[p]][[strong]]Typical Range:[[/strong]] 0.1 to 0.5.[[/p]]
+        [[ul style="padding-left: 20px; margin-top: 5px;"]]
+          [[li]]Higher dropout reduces overfitting but can slow learning.[[/li]]
+          [[li]]Lower dropout allows more learning but may overfit.[[/li]]
+        [[/ul]]
+        [[h4 style="margin-top: 10px;"]]Learning Rate[[/h4]]
+        [[p]][[strong]]Definition:[[/strong]] Controls how quickly the model adjusts its knowledge each step.[[/p]]
+        [[p]][[strong]]Typical Range:[[/strong]] 0.0001 to 0.1.[[/p]]
+        [[ul style="padding-left: 20px; margin-top: 5px;"]]
+          [[li]]Higher rates learn faster but can skip important details.[[/li]]
+          [[li]]Lower rates learn more carefully but slowly.[[/li]]
+        [[/ul]]
+        [[h4 style="margin-top: 10px;"]]Activation Function[[/h4]]
+        [[p]][[strong]]Definition:[[/strong]] The function that decides how a neuron fires. Introduces complexity to model patterns.[[/p]]
+        [[p]][[strong]]Common Choices:[[/strong]] ReLU, Sigmoid, Tanh.[[/p]]
+        [[h4 style="margin-top: 10px;"]]Hidden Layers[[/h4]]
+        [[p]][[strong]]Definition:[[/strong]] Layers between the input and output. More layers can detect more complex patterns.[[/p]]
+        [[p]][[strong]]Typical Range:[[/strong]] 1 to 5.[[/p]]
+        [[h4 style="margin-top: 10px;"]]What is Overfitting?[[/h4]]
+        [[p]]Overfitting happens when the model memorizes the training data rather than learning general patterns. Using dropout and proper tuning helps prevent this.[[/p]]
+      [[/details]]
+    [[/div]]
+    
+    [[div class="custom-container"]]
+      [[details]]
+        [[summary]]Advanced Settings[[/summary]]
+        [[form id="predictionForm" onsubmit="return false;"]]
+          [[div class="parameter-inputs"]]
+            [[div class="parameter-item"]]
+              [[label for="epochs"]]Epochs:[[br]]
+                [[input type="number" id="epochs" name="epochs" value="<?php echo htmlspecialchars($epochs); ?>" min="1"]]
+              [[/label]]
+            [[/div]]
+            [[div class="parameter-item"]]
+              [[label for="batchSize"]]Batch Size:[[br]]
+                [[input type="number" id="batchSize" name="batchSize" value="<?php echo htmlspecialchars($batchSize); ?>" min="1"]]
+              [[/label]]
+            [[/div]]
+            [[div class="parameter-item"]]
+              [[label for="dropoutRate"]]Dropout Rate:[[br]]
+                [[input type="number" id="dropoutRate" name="dropoutRate" step="0.1" value="<?php echo htmlspecialchars($dropoutRate); ?>" min="0" max="1"]]
+              [[/label]]
+            [[/div]]
+            [[div class="parameter-item"]]
+              [[label for="learningRate"]]Learning Rate:[[br]]
+                [[input type="number" id="learningRate" name="learningRate" step="0.0001" value="<?php echo htmlspecialchars($learningRate); ?>" min="0"]]
+              [[/label]]
+            [[/div]]
+            [[div class="parameter-item"]]
+              [[label for="activationFunction"]]Activation Function:[[br]]
+                [[select id="activationFunction" name="activationFunction"]]
+                  [[option value="relu" <?php echo $activationFunction === 'relu' ? 'selected' : ''; ?>]]ReLU[[/option]]
+                  [[option value="sigmoid" <?php echo $activationFunction === 'sigmoid' ? 'selected' : ''; ?>]]Sigmoid[[/option]]
+                  [[option value="tanh" <?php echo $activationFunction === 'tanh' ? 'selected' : ''; ?>]]Tanh[[/option]]
+                [[/select]]
+              [[/label]]
+            [[/div]]
+            [[div class="parameter-item"]]
+              [[label for="hiddenLayers"]]Hidden Layers:[[br]]
+                [[input type="number" id="hiddenLayers" name="hiddenLayers" value="<?php echo htmlspecialchars($hiddenLayers); ?>" min="1"]]
+              [[/label]]
+            [[/div]]
+            [[div class="parameter-item"]]
+              [[label for="latestDrawDate"]]Latest Draw Date:[[br]]
+                [[input type="date" id="latestDrawDate" name="latestDrawDate" value="<?php echo htmlspecialchars($latestDrawDate); ?>"]]
+              [[/label]]
+            [[/div]]
+          [[/div]]
+        [[/form]]
+      [[/details]]
+    [[/div]]
+    
+    [[div id="parameterDisplay"]]
+      [[h3]]Parameters Used for Analysis[[/h3]]
+      [[div class="parameterDisplayItem"]]
+        [[label]]Analysis Date and Time: [[/label]] [[span id="predictionDateValue"]]N/A[[/span]]
+      [[/div]]
+      [[div class="parameterDisplayItem"]]
+        [[label]]Total Entry Count: [[/label]] [[span]]<?php echo $totalEntryCount; ?>[[/span]]
+      [[/div]]
+      [[div class="parameterDisplayItem"]]
+        [[label]]Epochs: [[/label]] [[span id="epochValue"]]N/A[[/span]]
+      [[/div]]
+      [[div class="parameterDisplayItem"]]
+        [[label]]Batch Size: [[/label]] [[span id="batchSizeValue"]]N/A[[/span]]
+      [[/div]]
+      [[div class="parameterDisplayItem"]]
+        [[label]]Dropout Rate: [[/label]] [[span id="dropoutRateValue"]]N/A[[/span]]
+      [[/div]]
+      [[div class="parameterDisplayItem"]]
+        [[label]]Learning Rate: [[/label]] [[span id="learningRateValue"]]N/A[[/span]]
+      [[/div]]
+      [[div class="parameterDisplayItem"]]
+        [[label]]Activation Function: [[/label]] [[span id="activationFunctionValue"]]N/A[[/span]]
+      [[/div]]
+      [[div class="parameterDisplayItem"]]
+        [[label]]Hidden Layers: [[/label]] [[span id="hiddenLayersValue"]]N/A[[/span]]
+      [[/div]]
+      [[div class="parameterDisplayItem"]]
+        [[label]]Latest Draw Date: [[/label]] [[span id="latestDrawDateValue"]]N/A[[/span]]
+      [[/div]]
+      [[h3]]Drawn Numbers Used for Analysis Up to and Including[[/h3]]
+      
+     [[p]]
+  Drawn Date: [[strong]]<?php echo $nearestDrawDate; ?>[[/strong]],
+  Draw Numbers: [[strong]]<?php
+    echo is_array($nearestDrawNumbers)
+      ? implode(', ', $nearestDrawNumbers)
+      : htmlspecialchars($nearestDrawNumbers, ENT_QUOTES, 'UTF-8');
+  ?>[[/strong]]
+[[/p]]
+[[/div]]
+
+    
+    [[div id="countdown" class="countdown"]]Estimated time: Calculating...[[/div]]
+    
+    [[div id="loading" class="loading" style="display: none;"]]
+      [[p id="funMessage" class="fun-message"]][[strong]]Humor Display:[[/strong]] Initializing...[[/p]]
+      [[p id="progressMessage"]][[strong]]System Status:[[/strong]] Initializing...[[/p]]
+      [[div class="spinner"]][[/div]]
+      [[div class="progress-bar-container"]]
+        [[div id="progressBar" class="progress-bar"]]0%[[/div]]
+      [[/div]]
+    [[/div]]
+    
+    [[div id="prediction" style="display: none;"]]
+      [[h3]]Predicted Numbers[[/h3]]
+      [[div id="predictedNumbers"]][[/div]]
+    [[/div]]
+    
+    [[div class="breakdown-section" id="numberBreakdown" style="display: none;"]]
+      [[h3]]Most Likely Number Breakdown[[/h3]]
+      [[div id="numberBreakdownTable"]][[/div]]
+    [[/div]]
+    
+    [[div id="backtestNotice" style="display: none; background: #ffffff; color: #000; padding: 15px; border-radius: 5px; margin-top: 20px; border: 1px solid #ccc;"]]
+      [[h4]]Backtesting in Progress[[/h4]]
+      [[p]]The system is now running a backtest on the completed draws using your selected settings. Please note that this process could take several minutes.[[/p]]
+    [[/div]]
+    [[div id="backtestProgressContainer" style="display: none; margin-top: 10px;"]]
+      [[div id="backtestProgressBar" class="progress-bar"]]0%[[/div]]
+    [[/div]]
+    [[div id="backtestResults" style="display: none; margin-top: 20px;"]][[/div]]
+    
+    
+      <!-- SAVE PREDICTION SET FORM (Place this after your main analysis container) -->
+[[div id="saveFormContainer" style="background-color:#fff; border:1px solid #ccc; border-radius:10px; padding:10px 15px; font-size:13px; max-width:500px; margin:20px auto; text-align:center;"]]
+    [[h4 style="margin-bottom:10px; font-size:15px; font-weight:bold;"]]Save This Prediction Set[[/h4]]
+    [[form method="post" id="savePredictionForm" style="margin:0 auto;"]]
+      <?php echo JHtml::_('form.token'); ?>
+      [[input type="hidden" name="source" value="ai_prediction"]]
+      [[input type="hidden" name="lottery_id" value="<?php echo $lottery_id; ?>"]]
+      [[input type="hidden" name="main_numbers" id="saveMainNumbers"]]
+      [[input type="hidden" name="extra_ball_numbers" id="saveExtraBallNumbers"]]
+      [[input type="hidden" name="draws_analyzed" value="<?php echo $totalEntryCount; ?>"]]
+      [[input type="hidden" name="generated_at" value="<?php echo date('Y-m-d H:i:s'); ?>"]]
+      [[input type="hidden" name="generated_at" id="saveGeneratedAt" value=""]]
+      [[input type="hidden" name="next_draw_date" id="saveNextDrawDate" value="<?php echo htmlspecialchars($nextDraw); ?>"]]
+      [[input type="hidden" name="epochs" id="saveEpochs"]]
+      [[input type="hidden" name="batch_size" id="saveBatchSize"]]
+      [[input type="hidden" name="dropout_rate" id="saveDropoutRate"]]
+      [[input type="hidden" name="learning_rate" id="saveLearningRate"]]
+      [[input type="hidden" name="activation_function" id="saveActivationFunction"]]
+      [[input type="hidden" name="hidden_layers" id="saveHiddenLayers"]]
+
+      
+      [[label style="display:block; font-weight:bold; margin:6px 0 2px;"]]Label[[/label]]
+<?php $labelText = $lotteryName . " Prediction – " . date('M j, Y'); ?>
+[[input type="text" name="label" id="saveLabel" value="<?php echo htmlspecialchars($labelText); ?>" style="width:100%; …"]]
+
+      <?php if ($userCanSave): ?>
+        [[button type="submit" name="save_set" style="margin-top:10px; padding:7px 15px; background-color:#007bff; color:#fff; border:none; border-radius:5px; font-weight:bold; font-size:13px;"]]
+          Save to My LottoExpert
+        [[/button]]
+      <?php else: ?>
+       [[p style="color:#888;font-style:italic;"]]
+  You don’t have permission to save. Upgrade your plan to unlock this feature.
+       [[/p]]
+
+      <?php endif; ?>
+    [[/form]]
+[[/div]]
+    
+    
+    
+[[style]]
+  :root {
+    --primary-blue: #2a5298;
+    --tile-bg: #f0f4f8;
+    --text-main: #212121;
+    --text-muted: #555;
+    --grid-color: #cccccc;
+    --spacing: 1.5rem;   /* 24px */
+    --spacing-lg: 2rem;  /* 32px */
+  }
+
+  .lottery-analysis {
+    max-width: 800px;
+    margin: var(--spacing-lg) auto;
+    font-family: 'Roboto', sans-serif;
+    font-size: 16px;
+    line-height: 24px;
+    color: var(--text-main);
+    padding: 0 var(--spacing);
+  }
+
+  .lottery-analysis h2 {
+    font-size: 2rem;         /* 32px */
+    line-height: 2.5rem;     /* 40px */
+    font-weight: 700;
+    margin-bottom: var(--spacing);
+    color: var(--primary-blue);
+    text-transform: uppercase;
+  }
+
+  .lottery-analysis h3 {
+    font-size: 1.5rem;       /* 24px */
+    line-height: 2rem;       /* 32px */
+    font-weight: 500;
+    margin-bottom: var(--spacing);
+    color: var(--primary-blue);
+  }
+
+  .lottery-analysis p {
+    margin-bottom: var(--spacing);
+  }
+
+  .tile {
+    background: var(--tile-bg);
+    padding: var(--spacing);
+    margin: var(--spacing-lg) 0;
+    border-radius: 8px;
+  }
+
+  .tile table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: var(--spacing);
+  }
+
+  .tile th,
+  .tile td {
+    padding: var(--spacing);
+    font-size: 0.875rem;     /* 14px */
+    line-height: 1.25rem;    /* 20px */
+    border-bottom: 1px solid var(--grid-color);
+    text-align: left;
+  }
+
+  .tile th {
+    background: var(--primary-blue);
+    color: #fff;
+  }
+
+  .tile tr:nth-child(even) {
+    background: #ffffff;
+  }
+
+  .callout {
+    background: var(--tile-bg);
+    padding: var(--spacing);
+    margin-bottom: var(--spacing-lg);
+    border-left: 4px solid var(--primary-blue);
+    font-size: 1rem;
+    line-height: 1.5;
+  }
+
+  .callout-alt {
+    border-left-color: #e67e22;
+  }
+
+  .tile canvas {
+    width: 100% !important;
+    height: 40vh !important;
+    display: block;
+    margin-top: var(--spacing);
+  }
+
+  @media (max-width: 600px) {
+    .lottery-analysis {
+      padding: 0 1rem;
+    }
+    .tile {
+      margin: 1rem 0;
+    }
+    .tile canvas {
+      height: 30vh !important;
+    }
+  }
+[[/style]]
+
+
+
+[[div class="lottery-analysis"]]
+
+  [[section style="padding:20px; background-color:#f9f9f9; border-radius:8px; 
+                  box-shadow:0 2px 6px rgba(0,0,0,0.15); max-width:800px; margin:30px auto;"]]
+
+    [[h2 style="text-align:center; margin-bottom:15px; color:#2a5298;"]]
+      Why Should You Choose [[strong]]<?php echo $best['count'] ?>[[/strong]] Numbers?
+    [[/h2]]
+
+    [[p style="text-align:center; font-size:16px;"]]
+      Playing a lottery like <?php echo htmlspecialchars($lotteryName, ENT_QUOTES, 'UTF-8'); ?> can feel really difficult, right?  
+      You pick [[strong]]<?php echo $pickSize ?>[[/strong]] numbers from [[strong]]<?php echo $mainNumbersMax ?>[[/strong]]
+      <?php if ($hasExtraBall): ?>
+        and [[strong]]1 extra ball from <?php echo $extraBallMax ?>[[/strong]].
+      <?php endif; ?>[[br]]
+      Did you know the chance of guessing the exact <?php echo $pickSize ?> numbers correctly is only
+      [[strong]]1 in <?php echo number_format($totalCombinations) ?>[[/strong]]?
+    [[/p]]
+
+    [[p style="text-align:center; font-size:18px; font-weight:bold; color:#2a9d8f;"]]
+      But if you choose [[strong]]<?php echo $best['count'] ?>[[/strong]] numbers, your chances improve dramatically to about:
+    [[/p]]
+
+    [[p style="text-align:center; font-size:22px; font-weight:bold; margin:10px 0; color:#e67e22;"]]
+      1 in <?php echo number_format($best['odds']) ?>
+    [[/p]]
+
+    [[section class="tile"]]
+      [[h3 style="margin-top:0; color:#2a5298;"]]Let's Break This Down Simply[[/h3]]
+
+      [[table style="width:100%; border-collapse:collapse; text-align:center; font-size:14px; margin-top:10px;"]]
+        [[thead]]
+          [[tr style="background-color:#264653; color:#fff;"]]
+            [[th style="padding:5px;"]]Your Numbers[[/th]]
+            [[th style="padding:5px;"]]Ways to Match[[/th]]
+            [[th style="padding:5px;"]]Odds[[/th]]
+          [[/tr]]
+        [[/thead]]
+        [[tbody]]
+          <?php foreach ($stats as $row): ?>
+            [[tr style="<?php echo $row['count']==$best['count']
+                          ? 'font-weight:bold;background-color:#e9f5f3;'
+                          : '';?>"]]
+              [[td style="padding:5px;"]]<?php echo $row['count'] ?> numbers[[/td]]
+              [[td]]<?php echo number_format($row['ways']) ?> ways[[/td]]
+              [[td]]1 in <?php echo number_format($row['odds']) ?>[[/td]]
+            [[/tr]]
+          <?php endforeach; ?>
+        [[/tbody]]
+      [[/table]]
+
+      [[figure style="margin-top:10px; text-align:center;"]]
+        [[canvas id="coverageChart" width="300" height="150" style="max-width:100%;"]][[/canvas]]
+        [[figcaption style="font-size:0.8rem; color:#555; margin-top:5px;"]]
+          More numbers = better coverage!
+        [[/figcaption]]
+      [[/figure]]
+
+      [[p style="font-size:0.9rem; color:#555; margin-top:10px;"]]
+        Notice each time you add more numbers, your coverage increases.
+        Choosing <?php echo $best['count'] ?> numbers gives you the best balance
+        between odds and cost.
+      [[/p]]
+    [[/section]]
+
+  [[/section]]
+[[/div]]
+
+
+
+[[section class="tile mdc-card mdc-elevation--z1" role="region" aria-labelledby="ai-prediction-title" style="padding:24px; margin-top:24px;"]]
+  
+  [[h2 id="ai-prediction-title" class="mdc-typography--headline5" style="margin-bottom:16px; color:var(--primary-blue); text-align:center;"]]
+    How Our AI Prediction Works
+  [[/h2]]
+
+  [[p class="mdc-typography--body1" style="margin-bottom:24px; line-height:1.6;"]]
+    Our system leverages advanced machine‑learning techniques to analyze vast histories of lottery draws, uncovering subtle statistical patterns that humans alone would miss. Below is a step‑by‑step look “under the hood,” with accessible, human‑centered explanations for each phase.
+  [[/p]]
+
+  [[div class="step" style="margin-bottom:24px;"]]
+    [[h3 class="mdc-typography--subtitle1" style="margin-bottom:8px; color:var(--text-main);"]]
+      Gathering Data
+    [[/h3]]
+    [[p class="mdc-typography--body1" style="line-height:1.6;"]]
+      We begin by importing hundreds to thousands of past draw records from our secure database. Each record includes:[[br/]]
+      [[strong]]Winning numbers:[[​/strong]] the numbers drawn in each past game.[[br/]]
+      [[strong]]Draw dates:[[​/strong]] timestamps for every drawing.[[br/]]
+      [[strong]]Jackpot amounts:[[​/strong]] prize values, when available.[[br/]]
+      [[strong]]Bonus‑ball info:[[​/strong]] any extra‑ball or Powerball details.  
+      All data runs through automated integrity checks (duplicate detection, schema validation) and anomalies are flagged for review.
+    [[/p]]
+  [[/div]]
+
+  [[div class="step" style="margin-bottom:24px;"]]
+    [[h3 class="mdc-typography--subtitle1" style="margin-bottom:8px; color:var(--text-main);"]]
+      Data Preprocessing
+    [[/h3]]
+    [[p class="mdc-typography--body1" style="line-height:1.6;"]]
+      Raw draw data is transformed into model‑ready features:[[br/]]
+      [[strong]]Normalization:[[​/strong]] converting counts into percentages or standardized scores.[[br/]]
+      [[strong]]Vector encoding:[[​/strong]] mapping draws into consistent numeric arrays.[[br/]]
+      [[strong]]Outlier detection:[[​/strong]] using z‑scores and IQR to exclude skewed entries.[[br/]]
+      [[strong]]Feature engineering:[[​/strong]] creating time‑based metrics (rolling averages, intervals between repeats).
+    [[/p]]
+  [[/div]]
+
+  [[div class="step" style="margin-bottom:24px;"]]
+    [[h3 class="mdc-typography--subtitle1" style="margin-bottom:8px; color:var(--text-main);"]]
+      Training the AI Model
+    [[/h3]]
+    [[p class="mdc-typography--body1" style="line-height:1.6;"]]
+      We train a deep neural network with careful hyperparameter tuning:
+    [[/p]]
+    [[dl style="margin-left:16px; line-height:1.6;"]]
+      [[dt]][[strong]]Epochs:[[​/strong]][[/dt]]
+      [[dd]]Full passes through the dataset—each refines weights based on prediction error.[[/dd]]
+
+      [[dt]][[strong]]Batch Size:[[​/strong]][[/dt]]
+      [[dd]]Number of samples processed before each weight update; balances speed vs. stability.[[/dd]]
+
+      [[dt]][[strong]]Dropout Rate:[[​/strong]][[/dt]]
+      [[dd]]Randomly “drops” neurons each epoch to prevent overfitting and improve generalization.[[/dd]]
+
+      [[dt]][[strong]]Learning Rate:[[​/strong]][[/dt]]
+      [[dd]]Step size for weight adjustments; too large risks divergence, too small slows convergence.[[/dd]]
+
+      [[dt]][[strong]]Activation Function:[[​/strong]][[/dt]]
+      [[dd]]Non‑linear functions (ReLU, Sigmoid, Tanh) that let the network capture complex patterns.[[/dd]]
+
+      [[dt]][[strong]]Hidden Layers:[[​/strong]][[/dt]]
+      [[dd]]Stacked layers discover hierarchical patterns—from simple frequencies to advanced co‑occurrences.[[/dd]]
+    [[/dl]]
+    [[p class="mdc-typography--caption" style="margin-top:8px; color:var(--text-muted); font-style:italic;"]]
+      A validation split monitors overfitting—if validation metrics stall or degrade, we adjust epochs, dropout, or other hyperparameters.
+    [[/p]]
+  [[/div]]
+
+  [[div class="step" style="margin-bottom:24px;"]]
+    [[h3 class="mdc-typography--subtitle1" style="margin-bottom:8px; color:var(--text-main);"]]
+      Predicting Future Numbers
+    [[/h3]]
+    [[p class="mdc-typography--body1" style="line-height:1.6;"]]
+      Once trained, the model outputs a probability score for each number. We then:[[br/]]
+      [[strong]]Ranking:[[​/strong]] sort all numbers by descending probability.[[br/]]
+      [[strong]]Selection:[[​/strong]] pick the top N (e.g., 5 main + 1 bonus) as our recommended set.
+    [[/p]]
+  [[/div]]
+
+  [[div class="step" style="margin-bottom:24px;"]]
+    [[h3 class="mdc-typography--subtitle1" style="margin-bottom:8px; color:var(--text-main);"]]
+      Continuous Improvement
+    [[/h3]]
+    [[p class="mdc-typography--body1" style="line-height:1.6;"]]
+      We maintain an automated retraining pipeline:[[br/]]
+      [[strong]]Incremental updates:[[​/strong]] after every new draw, plus quick overnight refreshes.[[br/]]
+      [[strong]]Full retrains:[[​/strong]] weekly, to capture longer‑term trends while ensuring model stability.
+    [[/p]]
+  [[/div]]
+
+  [[div class="step" style="margin-bottom:24px;"]]
+    [[h3 class="mdc-typography--subtitle1" style="margin-bottom:8px; color:var(--text-main);"]]
+      Optional Backtesting
+    [[/h3]]
+    [[p class="mdc-typography--body1" style="line-height:1.6;"]]
+      Simulate historical performance before going live:[[br/]]
+      [[strong]]Configure:[[​/strong]] choose backtest length and metrics (hit‑rate, average matches).[[br/]]
+      [[strong]]Review:[[​/strong]] detailed tables comparing actual vs. predicted draws and match statistics.
+    [[/p]]
+  [[/div]]
+
+  [[div class="step" style="margin-bottom:24px;"]]
+    [[h3 class="mdc-typography--subtitle1" style="margin-bottom:8px; color:var(--text-main);"]]
+      Realistic Expectations
+    [[/h3]]
+    [[p class="mdc-typography--body1" style="line-height:1.6;"]]
+      While our AI dramatically narrows the field compared to random picks, no system can guarantee a jackpot. Please play responsibly and treat AI recommendations as probability‑based guidance, not certainties.
+    [[/p]]
+  [[/div]]
+
+  [[p class="mdc-typography--caption" style="margin-top:16px; color:var(--text-muted); text-align:center;"]]
+    Designed following ISO 9241‑210 human‑centered principles, W3C ARIA accessibility guidelines, and Google Material Design best practices.
+  [[/p]]
+
+[[/section]]
+
+
+
+  [[section class="tile"]]
+    [[h3 style="margin-top:0; color:#2a5298;"]]Getting Even Better with "Wheeling"[[/h3]]
+
+    [[p]]
+      "Wheeling" might sound tricky, but it's simple. It means using your 20 numbers and spreading them across several tickets in different combinations. Here's how it helps:
+    [[/p]]
+
+    [[table style="width:100%; border-collapse:collapse; text-align:center; font-size:14px; margin-top:10px;"]]
+      [[tbody]]
+        [[tr]][[td style="padding:5px; background-color:#f0f4f8;"]]Full Wheel (19 numbers)[[/td]][[td]]11,628 tickets[[/td]][[/tr]]
+        [[tr]][[td style="padding:5px; background-color:#f0f4f8;"]]Reduced Wheel (19 numbers)[[/td]][[td]]Just 28 tickets[[/td]][[/tr]]
+        [[tr]][[td style="padding:5px; background-color:#f0f4f8;"]]Guarantee[[/td]][[td]]At least 3 numbers matched[[/td]][[/tr]]
+        [[tr]][[td style="padding:5px; background-color:#f0f4f8;"]]Cost (at $2 per ticket)[[/td]][[td]]$56 total[[/td]][[/tr]]
+      [[/tbody]]
+    [[/table]]
+
+    [[p]]
+      Wheeling makes sure you have many chances to win something even if you don’t hit all 5 numbers exactly. It maximizes your odds while controlling costs.
+    [[/p]]
+
+    [[figure style="margin-top:10px; text-align:center;"]]
+      [[canvas id="ticketsChart" width="300" height="150" style="max-width:100%;"]][[/canvas]]
+      [[figcaption style="font-size:0.8rem; color:#555; margin-top:5px;"]]
+        Full Wheel vs. Reduced Wheel
+      [[/figcaption]]
+    [[/figure]]
+
+  [[/section]]
+
+  [[div style="margin-top:15px; background-color:#eafaf1; padding:10px; border-radius:6px; border-left:4px solid #2a9d8f; font-size:0.9rem;"]]
+    [[strong style="color:#264653;"]]Quick Tip:[[br]][[/strong]]
+    Use AI to select your 20 best numbers, then wheel them to win more often without spending too much!
+  [[/div]]
+
+  [[div style="margin-top:10px; background-color:#e9f1fa; padding:10px; border-radius:6px; border-left:4px solid #2b7ae4; font-size:0.9rem;"]]
+    [[strong style="color:#264653;"]]Did You Know?[[br]][[/strong]]
+    A 20-number selection covers 15,504 combinations—over 15,000 times better than choosing just 5 numbers alone!
+  [[/div]]
+
+  [[p style="margin-top:15px; font-style:italic; color:#555; font-size:0.9rem;"]]
+    [[strong]]Remember:[[br]][[/strong]]
+    Lotteries are fun but also unpredictable. Using AI and wheeling strategies gives you the best chance, but no one can guarantee a jackpot. Always play responsibly, and remember—just one ticket could change your life!
+  [[/p]]
+
+[[/section]]
+
+[[script src="https://cdn.jsdelivr.net/npm/chart.js"]][[/script]]
+
+[[script src="https://cdn.jsdelivr.net/npm/chart.js"]][[/script]]
+
+[[script]]
+document.addEventListener('DOMContentLoaded', function() {
+  const primaryBlue = getComputedStyle(document.documentElement)
+    .getPropertyValue('--primary-blue').trim();
+
+  const commonOptions = (yLabel) => ({
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      y: {
+        beginAtZero: true,
+        title: { display: true, text: yLabel, color: '#333' },
+        grid: { color: '#cccccc', lineWidth: 1 },
+        ticks: { color: '#333' }
+      },
+      x: {
+        title: { display: true, color: '#333' },
+        grid: { display: false },
+        ticks: { color: '#333' }
+      }
+    },
+    plugins: { legend: { display: false } },
+    layout: { padding: { top: 0, bottom: 0 } }
+  });
+
+  function makeBarChart(id, labels, data, yLabel) {
+    return new Chart(
+      document.getElementById(id).getContext('2d'),
+      {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            data,
+            backgroundColor: primaryBlue,
+            borderRadius: 4,
+            borderWidth: 1
+          }]
+        },
+        options: {
+          ...commonOptions(yLabel),
+          animation: {
+            onComplete: function() {
+              const chart = this;
+              const ctx   = chart.ctx;
+              ctx.textAlign = 'center';
+              ctx.fillStyle = '#000';
+              ctx.font      = '12px sans-serif';
+
+              chart.data.datasets.forEach((dataset, dsIndex) => {
+                const meta = chart.getDatasetMeta(dsIndex);
+                meta.data.forEach((bar, index) => {
+                  const rawValue = dataset.data[index];
+                  const label = yLabel.includes('Coverage')
+                    ? rawValue.toFixed(2) + '%'
+                    : rawValue;
+                  ctx.fillText(label, bar.x, bar.y - 6);
+                });
+              });
+            }
+          },
+          scales: {
+            ...commonOptions(yLabel).scales,
+            y: {
+              ...commonOptions(yLabel).scales.y,
+              ticks: {
+                ...commonOptions(yLabel).scales.y.ticks,
+                callback: function(val) {
+                  if (yLabel.includes('Coverage')) return val.toFixed(2) + '%';
+                  if (val >= 1000) return (val/1000).toFixed(0) + 'k';
+                  return val;
+                },
+                stepSize: yLabel.includes('Coverage') ? 5 : 3000
+              }
+            }
+          }
+        }
+      }
+    );
+  }
+
+  // 1) Coverage %
+  makeBarChart(
+    'coverageChart',
+    <?php echo json_encode(array_column($stats,'count')); ?>,
+    <?php echo json_encode(array_column($stats,'pct')); ?>,
+    'Coverage %'
+  );
+
+  // 2) Wheeling tickets
+  makeBarChart(
+    'ticketsChart',
+    ['Full Wheel','Reduced Wheel'],
+    [11628,28],
+    'Tickets'
+  );
+});
+[[/script]]
+
+
+
+  
+  [[script]]
+    document.addEventListener('DOMContentLoaded', function() {
+        function convertSorcererSyntaxToHTML(str) {
+  return str.replace(/\[\[/g, '<').replace(/\]\]/g, '>');
+}
+
+
+// --- BEGIN: Define renderBacktestResults FIRST --- 
+// ── UPDATED renderBacktestResults ──
+function renderBacktestResults(results) {
+  let tableHTML = `
+    [[style]]
+      .backtest-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 20px;
+      }
+      .backtest-table th, .backtest-table td {
+        border: 1px solid #ccc;
+        padding: 8px;
+        text-align: center;
+      }
+      .backtest-table th {
+        background-color: #3498db;
+        color: #fff;
+      }
+    [[/style]]
+    [[table class="backtest-table"]]
+      [[thead]]
+        [[tr]]
+          [[th]]Draw Date[[/th]]
+          [[th]]Actual Main Numbers[[/th]]
+          [[th]]Actual Extra Ball(s)[[/th]]
+          [[th]]Predicted Main Numbers (Top 20)[[/th]]
+          [[th]]Predicted Extra Ball(s)[[/th]]
+          [[th]]Main Match Count[[/th]]
+          [[th]]Extra Match Count[[/th]]
+        [[/tr]]
+      [[/thead]]
+      [[tbody]]
+  `;
+
+  results.forEach(r => {
+    tableHTML += `
+      [[tr]]
+        [[td]]${r.date}[[/td]]
+        [[td]]${r.actualMain}[[/td]]
+        [[td]]${r.actualExtra.length ? r.actualExtra.join(', ') : '–'}[[/td]]
+        [[td]]${r.predictedMain}[[/td]]
+        [[td]]${r.predictedExtra.length ? r.predictedExtra.join(', ') : '–'}[[/td]]
+        [[td]]${r.mainMatchCount}[[/td]]
+        [[td]]${r.extraMatchCount}[[/td]]
+      [[/tr]]
+    `;
+  });
+
+  tableHTML += `
+      [[/tbody]]
+    [[/table]]
+  `;
+  return tableHTML;
+}
+      // --- END: renderBacktestResults ---
+
+
+
+      // Prevent any accidental form submission
+      const predictionForm = document.getElementById('predictionForm');
+      if (predictionForm) {
+        predictionForm.addEventListener('submit', function(e) {
+          e.preventDefault();
+        });
+      }
+      
+      var draws = <?php echo json_encode($draws); ?>;
+      console.log("All Draws:", draws);
+      // Lottery parameters
+      const mainNumbersMax = <?php echo $mainNumbersMax; ?>;
+      const pickSize = <?php echo $pickSize; ?>;
+      const hasExtraBall = <?php echo $hasExtraBall ? 'true' : 'false'; ?>;
+      const numExtraBalls   = <?php echo $numExtraBalls; ?>;  
+      const extraBallMax = <?php echo $extraBallMax !== null ? $extraBallMax : 'null'; ?>;
+      const topExtraSuggestions = 3;
+        
+        
+      // Normalize data function
+      function normalizeData(data) {
+        return data.map(arr => arr.map((num, index) => {
+          if (index < pickSize) {
+            return num / mainNumbersMax;
+          } else if (hasExtraBall && extraBallMax !== null) {
+            return num / extraBallMax;
+          } else {
+            return num;
+          }
+        }));
+      }
+      
+      const predictionDiv = document.getElementById('prediction');
+      const loadingDiv = document.getElementById('loading');
+      const numberBreakdownDiv = document.getElementById('numberBreakdown');
+      const progressBar = document.getElementById('progressBar');
+      const progressMessage = document.getElementById('progressMessage');
+      const startButton = document.getElementById('startPrediction');
+      const countdownDiv = document.getElementById('countdown');
+      const funMessageDiv = document.getElementById('funMessage');
+      const predictedNumbersDiv = document.getElementById('predictedNumbers');
+      const numberBreakdownTableDiv = document.getElementById('numberBreakdownTable');
+      
+      const backtestNoticeDiv = document.getElementById('backtestNotice');
+      const backtestResultsDiv = document.getElementById('backtestResults');
+      const backtestProgressContainer = document.getElementById('backtestProgressContainer');
+      const backtestProgressBar = document.getElementById('backtestProgressBar');
+      const epochsInput = document.getElementById('epochs');
+      const batchSizeInput = document.getElementById('batchSize');
+      const dropoutRateInput = document.getElementById('dropoutRate');
+      const latestDrawDateInput = document.getElementById('latestDrawDate');
+      const learningRateInput = document.getElementById('learningRate');
+      const activationFunctionInput = document.getElementById('activationFunction');
+      const hiddenLayersInput = document.getElementById('hiddenLayers');
+      const enableBacktestCheckbox = document.getElementById('enableBacktest');
+      enableBacktestCheckbox.addEventListener('change', function() {
+        document.getElementById('numDrawsBacktest').disabled = !this.checked;
+      });
+      
+      const epochValue = document.getElementById('epochValue');
+      const batchSizeValue = document.getElementById('batchSizeValue');
+      const dropoutRateValue = document.getElementById('dropoutRateValue');
+      const latestDrawDateValue = document.getElementById('latestDrawDateValue');
+      const predictionDateValue = document.getElementById('predictionDateValue');
+      const learningRateValue = document.getElementById('learningRateValue');
+      const activationFunctionValue = document.getElementById('activationFunctionValue');
+      const hiddenLayersValue = document.getElementById('hiddenLayersValue');
+      
+      const funMessages = [
+        " AI is working its magic... ",
+        " Crunching numbers and probabilities...",
+        " Analyzing patterns in past draws...",
+        " Consulting the oracle of randomness...",
+        " Simulating thousands of possibilities...",
+        " Harnessing quantum fluctuations... ️",
+        " Peering into alternate realities...",
+        " Decoding the matrix...",
+        " Aligning with the stars...",
+        " Unlocking secrets of the universe...",
+        " Mapping out the lottery genome...",
+        " Listening to the numbers whisperer...",
+        " Unveiling hidden correlations...",
+        " Syncing with cosmic vibrations...",
+        " Translating binary code...",
+        " Optimizing neural pathways...",
+        " Calculating the meaning of life...",
+        " Connecting to the mainframe...",
+        " Disrupting statistical anomalies...",
+        " Venturing into the unknown..."
+      ];
+      
+      const messages = [
+        "System Status: Loading historical lottery data...",
+        "System Status: Initializing AI model...",
+        "System Status: Processing training data...",
+        "System Status: Training in progress...",
+        "System Status: Adjusting neural networks...",
+        "System Status: Optimizing parameters...",
+        "System Status: Generating Analysis...",
+        "System Status: Finalizing results...",
+        "System Status: Analysis complete!"
+      ];
+      
+      let startTime;
+      let epochStartTime;
+      let smoothedTimePerEpoch = 0;
+      const smoothingFactor = 0.1;
+      const funMessageInterval = 5000;
+      
+      // ================== BACKTEST FUNCTIONS (UPDATED) ==================
+      async function trainModelForBacktest(trainingDraws, settings, onEpochEndCallback) {
+        const normalizedData = normalizeData(trainingDraws.map(d => d.numbers));
+        const xs = [];
+        const ys_main = [];
+        const ys_extra = [];
+      
+        for (let i = 0; i < normalizedData.length - 1; i++) {
+          xs.push(normalizedData[i]);
+          const nextDraw = trainingDraws[i + 1].numbers;
+      
+          // Prepare Y for main numbers
+          const mainNumbers = nextDraw.slice(0, pickSize);
+          const mainNumbersVector = new Array(mainNumbersMax).fill(0);
+          mainNumbers.forEach(num => mainNumbersVector[num - 1] = 1);
+          ys_main.push(mainNumbersVector);
+      
+          // Prepare Y for extra ball if applicable
+          if (hasExtraBall) {
+            const extraNumber = nextDraw[pickSize];
+            const extraVector = new Array(extraBallMax).fill(0);
+            extraVector[extraNumber - 1] = 1;
+            ys_extra.push(extraVector);
+          }
+        }
+      
+        const xsTensor = tf.tensor2d(xs);
+        const ysMainTensor = tf.tensor2d(ys_main);
+      
+        let ysExtraTensor;
+        if (hasExtraBall) {
+          ysExtraTensor = tf.tensor2d(ys_extra);
+        }
+      
+        // Build the model
+        const inputShape = xs[0].length;
+        const input = tf.input({ shape: [inputShape] });
+      
+        let x = tf.layers.dense({ units: 128, activation: settings.ACTIVATION_FUNCTION }).apply(input);
+        x = tf.layers.dropout({ rate: settings.DROPOUT_RATE }).apply(x);
+      
+        for (let i = 0; i < settings.HIDDEN_LAYERS; i++) {
+          x = tf.layers.dense({ units: 64, activation: settings.ACTIVATION_FUNCTION }).apply(x);
+          x = tf.layers.dropout({ rate: settings.DROPOUT_RATE }).apply(x);
+        }
+      
+        const mainNumbersOutput = tf.layers.dense({
+          units: mainNumbersMax,
+          activation: 'sigmoid',
+          name: 'main_numbers_output'
+        }).apply(x);
+      
+        let outputs, model;
+        if (hasExtraBall) {
+          const extraOutput = tf.layers.dense({ units: extraBallMax, activation: 'sigmoid', name: 'extra_output' }).apply(x);
+          outputs = [mainNumbersOutput, extraOutput];
+          model = tf.model({ inputs: input, outputs: outputs });
+        } else {
+          outputs = mainNumbersOutput;
+          model = tf.model({ inputs: input, outputs: outputs });
+        }
+      
+        // Compile
+        const optimizer = tf.train.adam(settings.LEARNING_RATE);
+        let loss, metrics;
+        if (hasExtraBall) {
+          loss = ['binaryCrossentropy', 'binaryCrossentropy'];
+          metrics = ['accuracy'];
+        } else {
+          loss = 'binaryCrossentropy';
+          metrics = ['accuracy'];
+        }
+        model.compile({ optimizer, loss, metrics });
+      
+        // Prepare final Y
+        let yTrain;
+        if (hasExtraBall) {
+          yTrain = {
+            main_numbers_output: ysMainTensor,
+            extra_output: ysExtraTensor
+          };
+        } else {
+          yTrain = ysMainTensor;
+        }
+      
+        // Train with an onEpochEnd callback to increment the progress bar
+        await model.fit(xsTensor, yTrain, {
+          epochs: settings.EPOCHS,
+          batchSize: settings.BATCH_SIZE,
+          shuffle: false,
+          validationSplit: 0.2,
+          callbacks: {
+            onEpochEnd: () => {
+              onEpochEndCallback();
+            }
+          }
+        });
+      
+        return model;
+      }
+      
+
+// ── UPDATED runBacktesting ──
+async function runBacktesting(sortedDrawsAsc, settings) {
+  const results = [];
+  const N = sortedDrawsAsc.length;
+  const numBacktests = parseInt(document.getElementById('numDrawsBacktest').value) || 3;
+  const backtestIndices = [];
+  for (let i = N - numBacktests; i < N; i++) if (i >= 1) backtestIndices.push(i);
+
+  // total steps for progress bar
+  const totalSteps = backtestIndices.length * settings.EPOCHS;
+  let completedSteps = 0;
+  function updateBacktestProgress() {
+    completedSteps++;
+    const pct = Math.round((completedSteps/totalSteps)*100);
+    backtestProgressBar.style.width = pct + '%';
+    backtestProgressBar.textContent = pct + '%';
+    progressMessage.innerText = `System Status: Backtesting in progress... (${pct}%)`;
+  }
+
+  for (let idx of backtestIndices) {
+    // 1) actual draw
+    const nums = sortedDrawsAsc[idx].numbers;
+    const actualMainArr  = nums.slice(0, pickSize);
+    const actualExtraArr = hasExtraBall
+      ? nums.slice(pickSize, pickSize + numExtraBalls)
+      : [];
+
+    // 2) train & predict
+    const trainingDraws = sortedDrawsAsc.slice(0, idx);
+    const model = await trainModelForBacktest(trainingDraws, settings, updateBacktestProgress);
+
+    // normalize last training input
+    const lastNumsNorm = trainingDraws[trainingDraws.length - 1].numbers.map((v,i)=>{
+      return i < pickSize
+        ? v / mainNumbersMax
+        : (hasExtraBall ? v / extraBallMax : 0);
+    });
+    const pred = model.predict(tf.tensor2d([ lastNumsNorm ]));
+    const mainPredArr  = hasExtraBall ? pred[0].dataSync() : pred.dataSync();
+    const extraPredArr = hasExtraBall ? pred[1].dataSync() : [];
+
+    // 3) build top‐20 main predictions
+    const mainProbs = Array.from(mainPredArr)
+      .map((p,i)=>({number:i+1,prob:p}))
+      .sort((a,b)=>b.prob-a.prob)
+      .slice(0, 20);
+
+    let mainMatchCount = 0;
+    const predictedMain = mainProbs.map(x=>{
+      if (actualMainArr.includes(x.number)) {
+        mainMatchCount++;
+        return `[[span class="match"]]${x.number}[[/span]]`;
+      }
+      return x.number;
+    });
+
+// 4) build top extra predictions (count = topExtraSuggestions)
+let extraMatchCount = 0;
+let predictedExtra  = [];
+if (hasExtraBall) {
+  const extraProbs = Array.from(extraPredArr)
+    .map((p,i)=>({ number: i+1, prob: p }))
+    .sort((a,b)=> b.prob - a.prob)
+    .slice(0, topExtraSuggestions);    // ← use 3 suggestions
+
+  predictedExtra = extraProbs.map(x => {
+    if (actualExtraArr.includes(x.number)) {
+      extraMatchCount++;
+      return `[[span class="match"]]${x.number}[[/span]]`;
+    }
+    return x.number;
+  });
+}
+
+
+    // 5) push result row
+    results.push({
+      date:            sortedDrawsAsc[idx].draw_date,
+      actualMain:      actualMainArr.join(', '),
+      actualExtra:     actualExtraArr,
+      predictedMain:   predictedMain.join(', '),
+      predictedExtra:  predictedExtra,
+      mainMatchCount:  mainMatchCount,
+      extraMatchCount: extraMatchCount
+    });
+  }
+
+  return results;
+}
+      // ================== END BACKTEST FUNCTIONS (UPDATED) ==================
+      
+      startButton.addEventListener('click', async function startAnalysis(event) {
+        event.preventDefault();
+        loadingDiv.style.display = 'block';
+        startButton.style.display = 'none';
+        const EPOCHS = parseInt(epochsInput.value);
+        const BATCH_SIZE = parseInt(batchSizeInput.value);
+        const DROPOUT_RATE = parseFloat(dropoutRateInput.value);
+        const LEARNING_RATE = parseFloat(learningRateInput.value);
+        const ACTIVATION_FUNCTION = activationFunctionInput.value;
+        const HIDDEN_LAYERS = parseInt(hiddenLayersInput.value);
+        if (isNaN(EPOCHS) || EPOCHS <= 0) {
+          alert("Please enter a valid number of epochs.");
+          loadingDiv.style.display = 'none';
+          startButton.style.display = 'block';
+          return;
+        }
+        if (isNaN(BATCH_SIZE) || BATCH_SIZE <= 0) {
+          alert("Please enter a valid batch size.");
+          loadingDiv.style.display = 'none';
+          startButton.style.display = 'block';
+          return;
+        }
+        if (isNaN(DROPOUT_RATE) || DROPOUT_RATE < 0 || DROPOUT_RATE > 1) {
+          alert("Please enter a valid dropout rate between 0 and 1.");
+          loadingDiv.style.display = 'none';
+          startButton.style.display = 'block';
+          return;
+        }
+        if (isNaN(LEARNING_RATE) || LEARNING_RATE <= 0) {
+          alert("Please enter a valid learning rate greater than 0.");
+          loadingDiv.style.display = 'none';
+          startButton.style.display = 'block';
+          return;
+        }
+        if (!ACTIVATION_FUNCTION) {
+          alert("Please select an activation function.");
+          loadingDiv.style.display = 'none';
+          startButton.style.display = 'block';
+          return;
+        }
+        if (isNaN(HIDDEN_LAYERS) || HIDDEN_LAYERS <= 0) {
+          alert("Please enter a valid number of hidden layers.");
+          loadingDiv.style.display = 'none';
+          startButton.style.display = 'block';
+          return;
+        }
+        epochValue.innerText = EPOCHS;
+        batchSizeValue.innerText = BATCH_SIZE;
+        dropoutRateValue.innerText = DROPOUT_RATE;
+        learningRateValue.innerText = LEARNING_RATE;
+        activationFunctionValue.innerText = ACTIVATION_FUNCTION;
+        hiddenLayersValue.innerText = HIDDEN_LAYERS;
+        const latestDrawDate = latestDrawDateInput.value;
+        if (!latestDrawDate) {
+          alert("Please enter a valid latest draw date.");
+          loadingDiv.style.display = 'none';
+          startButton.style.display = 'block';
+          return;
+        }
+        latestDrawDateValue.innerText = latestDrawDate;
+        const filteredDraws = draws.filter(draw => new Date(draw.draw_date) <= new Date(latestDrawDate));
+        filteredDraws.sort((a, b) => new Date(b.draw_date) - new Date(a.draw_date));
+        if (filteredDraws.length < 2) {
+          alert("Not enough data before the selected date. Please choose a different date.");
+          loadingDiv.style.display = 'none';
+          startButton.style.display = 'block';
+          return;
+        }
+        const latestDrawData = filteredDraws[0];
+        const latestDraw = latestDrawData.numbers;
+        const historicalData = filteredDraws.map(draw => draw.numbers);
+        startTime = Date.now();
+        epochStartTime = Date.now();
+        let funMessageIndex = 0;
+        const funMessageTimer = setInterval(() => {
+          funMessageIndex = (funMessageIndex + 1) % funMessages.length;
+          funMessageDiv.innerText = funMessages[funMessageIndex];
+        }, funMessageInterval);
+        countdownDiv.innerHTML = "Estimated time: Calculating...";
+        try {
+          await tf.setBackend('cpu');
+          console.log('TensorFlow.js version:', tf.version.tfjs);
+          console.log('Backend:', tf.getBackend());
+          progressMessage.innerText = messages[0];
+          const normalizedHistoricalData = normalizeData(historicalData);
+          const xs = [];
+          const ys_main = [];
+          const ys_extra = [];
+          for (let i = 0; i < historicalData.length - 1; i++) {
+            xs.push(normalizedHistoricalData[i]);
+            const nextDraw = historicalData[i + 1];
+            const mainNumbers = nextDraw.slice(0, pickSize);
+            const mainNumbersVector = new Array(mainNumbersMax).fill(0);
+            mainNumbers.forEach(num => mainNumbersVector[num - 1] = 1);
+            ys_main.push(mainNumbersVector);
+            if (hasExtraBall) {
+              const extraNumber = nextDraw[pickSize];
+              const extraVector = new Array(extraBallMax).fill(0);
+              extraVector[extraNumber - 1] = 1;
+              ys_extra.push(extraVector);
+            }
+          }
+          const xsTensor = tf.tensor2d(xs);
+          const ysMainTensor = tf.tensor2d(ys_main);
+          let ysExtraTensor;
+          if (hasExtraBall) {
+            ysExtraTensor = tf.tensor2d(ys_extra);
+          }
+          const inputShape = xs[0].length;
+          const input = tf.input({ shape: [inputShape] });
+          let x = tf.layers.dense({ units: 128, activation: ACTIVATION_FUNCTION }).apply(input);
+          x = tf.layers.dropout({ rate: DROPOUT_RATE }).apply(x);
+          for (let i = 0; i < HIDDEN_LAYERS; i++) {
+            x = tf.layers.dense({ units: 64, activation: ACTIVATION_FUNCTION }).apply(x);
+            x = tf.layers.dropout({ rate: DROPOUT_RATE }).apply(x);
+          }
+          const mainNumbersOutput = tf.layers.dense({ units: mainNumbersMax, activation: 'sigmoid', name: 'main_numbers_output' }).apply(x);
+          let outputs, model;
+          if (hasExtraBall) {
+            const extraOutput = tf.layers.dense({ units: extraBallMax, activation: 'sigmoid', name: 'extra_output' }).apply(x);
+            outputs = [mainNumbersOutput, extraOutput];
+            model = tf.model({ inputs: input, outputs: outputs });
+          } else {
+            outputs = mainNumbersOutput;
+            model = tf.model({ inputs: input, outputs: outputs });
+          }
+          const optimizer = tf.train.adam(LEARNING_RATE);
+          let loss, metrics;
+          if (hasExtraBall) {
+            loss = ['binaryCrossentropy', 'binaryCrossentropy'];
+            metrics = ['accuracy'];
+          } else {
+            loss = 'binaryCrossentropy';
+            metrics = ['accuracy'];
+          }
+          model.compile({
+            optimizer: optimizer,
+            loss: loss,
+            metrics: metrics
+          });
+          let yTrain;
+          if (hasExtraBall) {
+            yTrain = {
+              main_numbers_output: ysMainTensor,
+              extra_output: ysExtraTensor
+            };
+          } else {
+            yTrain = ysMainTensor;
+          }
+          await model.fit(xsTensor, yTrain, {
+            epochs: EPOCHS,
+            batchSize: BATCH_SIZE,
+            shuffle: false,
+            validationSplit: 0.2,
+            callbacks: {
+              onEpochBegin: (epoch, logs) => {
+                epochStartTime = Date.now();
+                progressMessage.innerText = messages[3];
+              },
+              onEpochEnd: (epoch, logs) => {
+                let epochEndTime = Date.now();
+                let epochDuration = (epochEndTime - epochStartTime) / 1000;
+                if (epoch === 0) {
+                  smoothedTimePerEpoch = epochDuration;
+                } else {
+                  smoothedTimePerEpoch = (smoothingFactor * epochDuration) + ((1 - smoothingFactor) * smoothedTimePerEpoch);
+                }
+                let epochsRemaining = EPOCHS - (epoch + 1);
+                let estimatedRemainingTime = epochsRemaining * smoothedTimePerEpoch;
+                if (estimatedRemainingTime > 0) {
+                  let minutes = Math.floor(estimatedRemainingTime / 60);
+                  let seconds = Math.floor(estimatedRemainingTime % 60);
+                  countdownDiv.innerHTML = `Estimated time left: ${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                } else {
+                  countdownDiv.innerHTML = "Main analysis completed! Now running backtesting...";
+                }
+                let percentage = Math.round(((epoch + 1) / EPOCHS) * 100);
+                progressBar.style.width = percentage + '%';
+                progressBar.textContent = percentage + '%';
+                let msgIndex = Math.floor((percentage / 100) * messages.length);
+                if (msgIndex >= messages.length) {
+                  msgIndex = messages.length - 1;
+                }
+                progressMessage.innerText = messages[msgIndex];
+              }
+            }
+          });
+          progressMessage.innerText = messages[6];
+          const normalizedLatestDraw = normalizeData([latestDraw])[0];
+          const prediction = model.predict(tf.tensor2d([normalizedLatestDraw]));
+          let mainNumbersPrediction, extraPrediction;
+          if (hasExtraBall) {
+            mainNumbersPrediction = prediction[0].dataSync();
+            extraPrediction = prediction[1].dataSync();
+          } else {
+            mainNumbersPrediction = prediction.dataSync();
+          }
+          const mainNumbersProbabilities = Array.from(mainNumbersPrediction)
+            .map((prob, index) => ({ number: index + 1, probability: prob }));
+          mainNumbersProbabilities.sort((a, b) => b.probability - a.probability);
+          const predictedMainNumbers = mainNumbersProbabilities.slice(0, pickSize);
+          let numbersHTML = '';
+      
+          // Add main numbers
+          predictedMainNumbers.slice(0, pickSize).forEach((item) => {
+              numbersHTML += `[[span class="number-ball"]]${item.number}[[/span]]\n`;
+          });
+      
+          // Add extra ball if available
+          if (hasExtraBall && predictedMainNumbers.length > pickSize) {
+              let extraBall = predictedMainNumbers[pickSize]; // The extra ball
+              numbersHTML += `[[span class="number-ball powerball"]]${extraBall.number}[[/span]]\n`;
+          }
+      
+          predictedNumbersDiv.style.display = "none";
+      
+          let breakdownHTML = `
+            [[h3]]Top 20 Main Numbers Breakdown[[/h3]]
+            [[table]]
+              [[thead]]
+                [[tr]]
+                  [[th]]Number[[/th]]
+                  [[th]]Probability (%)[[/th]]
+                [[/tr]]
+              [[/thead]]
+              [[tbody]]
+          `;
+          mainNumbersProbabilities.slice(0, 20).forEach(item => {
+            const probabilityPercentage = (item.probability * 100).toFixed(2);
+            breakdownHTML += `
+              [[tr]]
+                [[td]]${item.number}[[/td]]
+                [[td]]${probabilityPercentage}%[[/td]]
+              [[/tr]]
+            `;
+          });
+          breakdownHTML += `
+              [[/tbody]]
+            [[/table]]
+          `;
+          if (hasExtraBall) {
+            const extraProbabilities = Array.from(extraPrediction)
+              .map((prob, index) => ({ number: index + 1, probability: prob }));
+            extraProbabilities.sort((a, b) => b.probability - a.probability);
+            breakdownHTML += `
+              [[h3]]Top 3 Extra Numbers Breakdown[[/h3]]
+              [[table]]
+                [[thead]]
+                  [[tr]]
+                    [[th]]Number[[/th]]
+                    [[th]]Probability (%)[[/th]]
+                  [[/tr]]
+                [[/thead]]
+                [[tbody]]
+            `;
+            extraProbabilities.slice(0, 3).forEach(item => {
+              const probabilityPercentage = (item.probability * 100).toFixed(2);
+              breakdownHTML += `
+                [[tr]]
+                  [[td]]${item.number}[[/td]]
+                  [[td]]${probabilityPercentage}%[[/td]]
+                [[/tr]]
+              `;
+            });
+            breakdownHTML += `
+                [[/tbody]]
+              [[/table]]
+            `;
+          }
+          numberBreakdownTableDiv.innerHTML = breakdownHTML;
+          
+          progressMessage.innerText = messages[8];
+          const predictionDate = new Date();
+          const predictionDateString = predictionDate.toLocaleString();
+          predictionDateValue.innerText = predictionDateString;
+ 
+   
+        
+        // (1) capture your PHP lotteryName into JS input
+const lotteryName = <?php echo json_encode($lotteryName); ?>;
+
+// (2) update the hidden generated_at if you haven’t already
+document.getElementById('saveGeneratedAt').value =
+  predictionDateString; // or use your formatDateForDB() if you need YYYY‑MM‑DD HH:MM:SS
+
+// (3) now push the same timestamp into your label field
+document.getElementById('saveLabel').value =
+  `${lotteryName} Prediction – ${predictionDateString}`;
+
+        
+        
+        // — format to YYYY‑MM‑DD HH:MM:SS for our DB —
+function formatDateForDB(d) {
+  const p = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ` +
+         `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// mirror the exact same display timestamp into the form
+document.getElementById('saveGeneratedAt').value = predictionDateString;
+
+// Save AI analysis specs to hidden fields
+document.getElementById('saveEpochs').value              = EPOCHS;
+document.getElementById('saveBatchSize').value           = BATCH_SIZE;
+document.getElementById('saveDropoutRate').value         = DROPOUT_RATE;
+document.getElementById('saveLearningRate').value        = LEARNING_RATE;
+document.getElementById('saveActivationFunction').value  = ACTIVATION_FUNCTION;
+document.getElementById('saveHiddenLayers').value        = HIDDEN_LAYERS;
+
+ 
+           // After generating the predictions, populate the hidden fields in the save form
+          // For MAIN numbers, use all predicted main numbers instead of just the first "pickSize".
+          const mainPredictionNumbers = mainNumbersProbabilities.map(item => item.number).join(',');
+      
+          // For the EXTRA ball predictions, if applicable, compute the entire sorted list
+          let extraPredictionNumbers = "";
+          if (hasExtraBall) {
+            const extraProbabilities = Array.from(extraPrediction).map((prob, index) => ({ number: index + 1, probability: prob }));
+            extraProbabilities.sort((a, b) => b.probability - a.probability);
+            extraPredictionNumbers = extraProbabilities.map(item => item.number).join(',');
+          }
+      
+          // Populate the hidden form fields with the entire list of predicted values.
+          document.getElementById('saveMainNumbers').value = mainPredictionNumbers;
+          document.getElementById('saveExtraBallNumbers').value = extraPredictionNumbers;
+      
+          // BEGIN BACKTESTING STEP (if user enabled it)
+          if (enableBacktestCheckbox.checked) {
+            backtestNoticeDiv.style.display = 'block';
+            backtestProgressContainer.style.display = 'block';
+            countdownDiv.innerHTML = "Running backtesting on previous draws...";
+      
+            const sortedDrawsAsc = [...filteredDraws].sort((a, b) => new Date(a.draw_date) - new Date(b.draw_date));
+            const settings = {
+              EPOCHS: EPOCHS,
+              BATCH_SIZE: BATCH_SIZE,
+              DROPOUT_RATE: DROPOUT_RATE,
+              LEARNING_RATE: LEARNING_RATE,
+              ACTIVATION_FUNCTION: ACTIVATION_FUNCTION,
+              HIDDEN_LAYERS: HIDDEN_LAYERS
+            };
+            const backtestResults = await runBacktesting(sortedDrawsAsc, settings);
+            const backtestHTML = renderBacktestResults(backtestResults);
+            backtestResultsDiv.innerHTML = backtestHTML;
+            backtestResultsDiv.style.display = 'block';
+            
+            // Update backtesting notice and hide the progress bar now that backtesting is complete
+            backtestNoticeDiv.innerHTML = "[[h4]]Backtesting Complete[[/h4]][[p]]Backtesting has finished processing all draws.[[/p]]";
+            backtestProgressContainer.style.display = 'none';
+      
+            // ✅ Update message to show final completion
+            countdownDiv.innerHTML = "Done! Analysis is complete.";
+      
+          }
+          // END BACKTESTING STEP
+          setTimeout(() => {
+            loadingDiv.style.display = 'none';
+            predictionDiv.style.display = 'block';
+            numberBreakdownDiv.style.display = 'block';
+          }, 1000);
+          clearInterval(funMessageTimer);
+        } catch (error) {
+          console.error('Error during model training or Analysis:', error);
+          loadingDiv.innerText = 'An error occurred during model training or Analysis: ' + error.message;
+          startButton.style.display = 'block';
+        }
+      });
+    });
+  [[/script]]
+[[/body]]
+[[/html]]
+
+{/source}
